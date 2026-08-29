@@ -1,0 +1,12 @@
+{
+  "questions": [
+    {"id": 1, "all_of": ["todo_app/__main__.py", "cli.main"]},
+    {"id": 2, "all_of": ["todo_app/cli.py", "todo_app/service.py", "todo_app/repository.py", "todo_app/models.py"]},
+    {"id": 3, "all_of": ["cli.py", "service.py", "repository.py"]},
+    {"id": 4, "all_of": ["tasks.json", "JSON"]},
+    {"id": 5, "all_of": ["python -m todo_app"]},
+    {"id": 6, "all_of": ["python -m unittest discover -s project_tests -v"]},
+    {"id": 7, "all_of": ["--data", "tasks.json", "todo_app/cli.py"]},
+    {"id": 8, "all_of": ["todo_app/cli.py", "todo_app/service.py", "project_tests"]}
+  ]
+}

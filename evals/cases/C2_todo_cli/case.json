@@ -1,0 +1,8 @@
+{
+  "id": "C2",
+  "category": "create",
+  "title": "从零创建 TODO CLI",
+  "task_file": "task.md",
+  "workspace": null,
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 20}
+}

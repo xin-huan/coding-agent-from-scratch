@@ -1,0 +1,8 @@
+{
+  "id": "F2",
+  "category": "feature",
+  "title": "为 TODO 增加删除命令",
+  "task_file": "task.md",
+  "workspace": "workspace",
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 20}
+}

@@ -1,0 +1,8 @@
+{
+  "id": "B2",
+  "category": "bugfix",
+  "title": "修复 TODO 数据保存问题",
+  "task_file": "task.md",
+  "workspace": "workspace",
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 20}
+}

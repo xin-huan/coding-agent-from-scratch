@@ -1,0 +1,8 @@
+{
+  "id": "E1",
+  "category": "explain",
+  "title": "解释小型分层项目",
+  "task_file": "task.md",
+  "workspace": "workspace",
+  "grader": {"kind": "facts", "reference": "reference.json"}
+}

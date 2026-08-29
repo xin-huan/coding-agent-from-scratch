@@ -1,0 +1,12 @@
+{
+  "questions": [
+    {"id": 1, "all_of": ["notes_app/__main__.py", "app.main"]},
+    {"id": 2, "all_of": ["notes_app/app.py", "notes_app/config.py", "notes_app/service.py", "notes_app/validation.py", "notes_app/repository.py"]},
+    {"id": 3, "all_of": ["app.py", "service.py", "validation.py", "repository.py"]},
+    {"id": 4, "all_of": ["notes.json", "JSON"]},
+    {"id": 5, "all_of": ["python -m notes_app"]},
+    {"id": 6, "all_of": ["python -m unittest discover -s project_tests -v"]},
+    {"id": 7, "all_of": ["notes.json", "config.json", "NOTES_DATA_PATH"]},
+    {"id": 8, "all_of": ["notes_app/validation.py", "project_tests"]}
+  ]
+}

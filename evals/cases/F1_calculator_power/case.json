@@ -1,0 +1,8 @@
+{
+  "id": "F1",
+  "category": "feature",
+  "title": "为计算器增加幂运算",
+  "task_file": "task.md",
+  "workspace": "workspace",
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 20}
+}

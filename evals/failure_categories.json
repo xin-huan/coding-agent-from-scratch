@@ -1,0 +1,12 @@
+[
+  {"id": "requirements_misunderstood", "description": "需求理解错误或遗漏必需行为"},
+  {"id": "key_file_not_read", "description": "没有读取完成任务所需的关键文件"},
+  {"id": "tool_arguments_invalid", "description": "工具名称或参数错误"},
+  {"id": "implementation_error", "description": "代码实现或修改内容错误"},
+  {"id": "test_execution_error", "description": "没有正确运行或理解测试"},
+  {"id": "recovery_failed", "description": "观察到错误后未能继续修正"},
+  {"id": "loop_or_context_error", "description": "循环终止、上下文或状态管理问题"},
+  {"id": "timeout_or_model_error", "description": "任务超时或模型调用失败"},
+  {"id": "permission_blocked", "description": "安全策略阻止了完成任务所需的合理操作"},
+  {"id": "inaccurate_final_report", "description": "最终回答与文件或测试的真实结果不一致"}
+]

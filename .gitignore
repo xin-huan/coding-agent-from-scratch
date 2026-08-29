@@ -225,3 +225,6 @@ agent.md
 
 # Local agent execution traces
 .coding-agent/
+
+# Generated evaluation runs
+evals/results/
