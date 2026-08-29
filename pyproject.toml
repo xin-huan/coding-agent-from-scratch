@@ -7,10 +7,10 @@ name = "coding-agent-from-scratch"
 version = "0.1.0"
 description = "A lightweight coding agent built from scratch"
 requires-python = ">=3.10"
+dependencies = ["openai>=1.0"]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

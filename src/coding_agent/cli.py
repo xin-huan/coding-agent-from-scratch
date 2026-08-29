@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from coding_agent.agent import Agent, AgentError
 from coding_agent.config import ConfigError, Settings
+from coding_agent.model import DeepSeekModel, ModelError
+from coding_agent.trace import JsonlTrace
+from coding_agent.workspace import Workspace, WorkspaceError
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -23,9 +27,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    workspace = args.workspace.resolve()
-    if not workspace.is_dir():
-        print(f"工作目录不存在: {workspace}", file=sys.stderr)
+    try:
+        workspace = Workspace(args.workspace)
+    except WorkspaceError as error:
+        print(f"工作目录错误: {error}", file=sys.stderr)
         return 2
 
     try:
@@ -35,8 +40,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     print("Coding Agent")
-    print(f"工作目录: {workspace}")
+    print(f"工作目录: {workspace.root}")
     print(f"模型: {settings.model}")
+    agent: Agent | None = None
 
     while True:
         try:
@@ -48,9 +54,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if task == "/exit":
             return 0
         if task:
-            print("Agent Runtime 将在下一阶段接入。")
+            if agent is None:
+                trace = JsonlTrace.create(Path.cwd() / ".coding-agent" / "traces")
+                print(f"[日志] {trace.path}")
+                agent = Agent(
+                    DeepSeekModel(settings),
+                    workspace,
+                    on_event=print,
+                    trace=trace,
+                )
+            try:
+                answer = agent.run(task)
+            except (AgentError, ModelError, OSError) as error:
+                print(f"任务失败: {error}", file=sys.stderr)
+            else:
+                print(f"Agent > {answer}")
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -219,3 +219,9 @@ __marimo__/
 
 # Local planning notes and collected materials
 docs/
+
+# Local development memory
+agent.md
+
+# Local agent execution traces
+.coding-agent/
