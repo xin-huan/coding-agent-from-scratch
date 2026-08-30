@@ -7,7 +7,10 @@ import re
 from pathlib import Path
 
 
-SECTION = re.compile(r"^\s*(\d+)\s*[.、)]\s*(.*)$")
+MARKDOWN_SECTION = re.compile(
+    r"^\s*(?:#{1,6}\s+|\*\*)(\d+)\s*[.、)]\s*(.*?)(?:\*\*)?\s*$"
+)
+PLAIN_SECTION = re.compile(r"^\s*(\d+)\s*[.、)]\s*(.*)$")
 
 
 def _normalise(text: str) -> str:
@@ -15,10 +18,16 @@ def _normalise(text: str) -> str:
 
 
 def _split_sections(answer: str) -> dict[int, str]:
+    lines = answer.splitlines()
+    pattern = (
+        MARKDOWN_SECTION
+        if any(MARKDOWN_SECTION.match(line) for line in lines)
+        else PLAIN_SECTION
+    )
     sections: dict[int, list[str]] = {}
     current: int | None = None
-    for line in answer.splitlines():
-        match = SECTION.match(line)
+    for line in lines:
+        match = pattern.match(line)
         if match:
             current = int(match.group(1))
             sections[current] = [match.group(2)]

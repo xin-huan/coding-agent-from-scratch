@@ -355,6 +355,40 @@ class RoundTripTests(unittest.TestCase):
             self.assertEqual(result.score, 100.0)
             self.assertEqual(result.changed_files, [])
 
+    def test_explanation_scoring_accepts_markdown_numbered_headings(self) -> None:
+        case = load_cases(CASES_DIR)[7]
+        answer = """**1. 项目的入口文件在哪里？**
+notes_app/__main__.py 调用 notes_app.app.main。
+**2. 主要模块分别负责什么？**
+notes_app/app.py、notes_app/config.py、notes_app/service.py、notes_app/validation.py、notes_app/repository.py。
+**3. 一次典型请求经过哪些模块？**
+app.py、service.py、validation.py、repository.py。
+1. app.py 解析请求。
+2. service.py 调用 validation.py 和 repository.py。
+**4. 数据保存在哪里？**
+notes.json，格式为 JSON。
+**5. 项目如何启动？**
+python -m notes_app
+**6. 测试如何运行？**
+python -m unittest discover -s project_tests -v
+**7. 配置从哪里加载？**
+notes.json、config.json、NOTES_DATA_PATH。
+1. notes.json 是默认值。
+2. config.json 随后覆盖。
+3. NOTES_DATA_PATH 优先级最高。
+**8. 修改哪些位置？**
+notes_app/validation.py 和 project_tests。"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = evaluate_case(
+                case,
+                lambda _workspace, _task, _trace: answer,
+                Path(temp_dir) / "E2",
+            )
+
+        self.assertTrue(result.passed, result.grader_output)
+        self.assertEqual(result.score, 100.0)
+
     def test_explanation_cases_accept_code_supported_answers(self) -> None:
         cases = {case.id: case for case in load_cases(CASES_DIR)}
         answers = {
@@ -478,6 +512,47 @@ unittest.main()
 
         self.assertFalse(result.passed)
         self.assertEqual(result.score, 50.0)
+
+    def test_runs_acceptance_even_when_agent_does_not_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            case_root = root / "case"
+            case_root.mkdir()
+            (case_root / "grader.py").write_text(
+                """import sys
+import unittest
+from pathlib import Path
+
+workspace = Path(sys.argv.pop(1))
+
+class Checks(unittest.TestCase):
+    def test_artifact_exists(self):
+        self.assertTrue((workspace / "answer.txt").exists())
+
+unittest.main()
+""",
+                encoding="utf-8",
+            )
+            case = EvalCase(
+                "T3",
+                "test",
+                "Interrupted",
+                "Create answer",
+                case_root,
+                None,
+                {"kind": "python", "path": "grader.py", "timeout": 5},
+            )
+
+            def interrupted_agent(workspace: Path, _task: str, _trace: Path) -> str:
+                (workspace / "answer.txt").write_text("done\n", encoding="utf-8")
+                raise RuntimeError("tool budget exhausted")
+
+            result = evaluate_case(case, interrupted_agent, root / "result")
+
+        self.assertFalse(result.passed)
+        self.assertFalse(result.agent_completed)
+        self.assertTrue(result.acceptance_passed)
+        self.assertEqual(result.score, 100.0)
 
 
 if __name__ == "__main__":

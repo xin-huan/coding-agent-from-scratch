@@ -15,6 +15,16 @@ from coding_agent.tools.filesystem import (
 from coding_agent.workspace import Workspace
 
 
+FILE_PATH_DESCRIPTION = (
+    "File path relative to the workspace root. For example, 'README.md' or "
+    "'todo_app/core.py'. Never use an absolute path or a '/workspace/...' path."
+)
+DIRECTORY_PATH_DESCRIPTION = (
+    "Directory path relative to the workspace root. For example, '.' or "
+    "'todo_app'. Never use an absolute path or a '/workspace/...' path."
+)
+
+
 TOOL_DEFINITIONS: list[dict[str, object]] = [
     {
         "type": "function",
@@ -26,7 +36,7 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory path.",
+                        "description": DIRECTORY_PATH_DESCRIPTION,
                     }
                 },
                 "additionalProperties": False,
@@ -43,7 +53,7 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path.",
+                        "description": FILE_PATH_DESCRIPTION,
                     }
                 },
                 "required": ["path"],
@@ -62,7 +72,7 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
                     "query": {"type": "string"},
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory path.",
+                        "description": DIRECTORY_PATH_DESCRIPTION,
                     },
                 },
                 "required": ["query"],
@@ -78,7 +88,10 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": FILE_PATH_DESCRIPTION,
+                    },
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
@@ -94,7 +107,10 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": FILE_PATH_DESCRIPTION,
+                    },
                     "old_text": {"type": "string"},
                     "new_text": {"type": "string"},
                 },
@@ -117,7 +133,7 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Workspace-relative working directory.",
+                        "description": DIRECTORY_PATH_DESCRIPTION,
                     },
                     "timeout_seconds": {
                         "type": "number",

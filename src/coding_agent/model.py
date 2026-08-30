@@ -25,12 +25,14 @@ class DeepSeekModel:
     def complete(
         self, messages: list[dict[str, object]], tools: list[dict[str, object]]
     ) -> ModelReply:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=tools,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+        if tools:
+            request["tools"] = tools
+        response = self.client.chat.completions.create(**request)
         message = response.choices[0].message
 
         tool_calls: list[ToolCall] = []

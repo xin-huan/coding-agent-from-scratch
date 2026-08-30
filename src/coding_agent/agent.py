@@ -122,9 +122,40 @@ class Agent:
                     }
                 )
 
-        error = AgentError(f"Agent exceeded the maximum of {self.max_steps} steps")
-        self.trace.record("task_error", step=self.max_steps, error=str(error))
-        raise error
+        final_step = self.max_steps + 1
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "The tool budget is exhausted. Do not call more tools. "
+                    "Give a concise, honest final report based on the results above."
+                ),
+            }
+        )
+        self.trace.record("model_request", step=final_step, finalization=True)
+        try:
+            reply = self.model.complete(messages, [])
+        except Exception as error:
+            self.trace.record(
+                "task_error",
+                step=final_step,
+                error_type=type(error).__name__,
+            )
+            raise AgentError(f"Final model request failed: {error}") from error
+
+        self.trace.record(
+            "model_reply",
+            step=final_step,
+            content=reply.content,
+            tools=[call.name for call in reply.tool_calls],
+        )
+        if reply.tool_calls or not reply.content:
+            error = AgentError("Model did not provide a final answer after tool limit")
+            self.trace.record("task_error", step=final_step, error=str(error))
+            raise error
+
+        self.trace.record("task_complete", step=final_step, answer=reply.content)
+        return reply.content
 
     @staticmethod
     def _assistant_message(reply: ModelReply) -> dict[str, object]:

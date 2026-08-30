@@ -34,6 +34,8 @@ class EvalResult:
     grader_output: str
     model_calls: int = 0
     tool_calls: int = 0
+    agent_completed: bool = True
+    acceptance_passed: bool | None = None
 
 
 def _snapshot(root: Path) -> dict[str, str]:
@@ -159,31 +161,29 @@ def evaluate_case(
 
     started = time.monotonic()
     failure_reason: str | None = None
+    agent_completed = True
     try:
         answer = run_agent(workspace, case.task, run_dir / "trace.jsonl")
     except Exception as error:
+        agent_completed = False
         answer = f"{type(error).__name__}: {error}"
-        passed = False
-        grader_output = "Grader was not run because the agent failed."
         failure_reason = "agent_error"
-        score = 0.0
-        grader_kind = case.grader.get("kind")
+    grader_kind = case.grader.get("kind")
+    if grader_kind == "python":
+        acceptance_passed, score, grader_output = _run_python_grader(case, workspace)
+    elif grader_kind == "facts":
+        reference = case.root / str(case.grader["reference"])
+        acceptance_passed, score, grader_output = grade_facts(answer, reference)
     else:
-        grader_kind = case.grader.get("kind")
-        if grader_kind == "python":
-            passed, score, grader_output = _run_python_grader(case, workspace)
-        elif grader_kind == "facts":
-            reference = case.root / str(case.grader["reference"])
-            passed, score, grader_output = grade_facts(answer, reference)
-        else:
-            raise ValueError(f"Unsupported grader kind: {grader_kind}")
+        raise ValueError(f"Unsupported grader kind: {grader_kind}")
     changed_files = _changed_files(before, _snapshot(workspace))
     changes_patch = _make_patch(before_text, _text_snapshot(workspace))
-    if grader_kind == "facts" and changed_files and failure_reason != "agent_error":
+    if grader_kind == "facts" and changed_files and agent_completed:
         score = max(0.0, score - 10.0)
-        passed = score >= 80.0
+        acceptance_passed = score >= 80.0
         grader_output += "Modification penalty: -10 points\n"
-    if not passed and failure_reason is None:
+    passed = agent_completed and acceptance_passed
+    if not acceptance_passed and failure_reason is None:
         failure_reason = "acceptance_failed"
     model_calls, tool_calls = _trace_counts(run_dir / "trace.jsonl")
 
@@ -199,6 +199,8 @@ def evaluate_case(
         grader_output=grader_output,
         model_calls=model_calls,
         tool_calls=tool_calls,
+        agent_completed=agent_completed,
+        acceptance_passed=acceptance_passed,
     )
     (run_dir / "answer.txt").write_text(answer, encoding="utf-8")
     (run_dir / "grader.txt").write_text(grader_output, encoding="utf-8")
@@ -250,14 +252,16 @@ def write_summary(results: list[EvalResult], output_dir: Path) -> None:
             "",
             "## Cases",
             "",
-            "| Case | Category | Result | Score | Seconds | Models | Tools | Failure |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+            "| Case | Category | Result | Agent | Acceptance | Score | Seconds | Models | Tools | Failure |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     for result in results:
         lines.append(
             f"| {result.case_id} | {result.category} | "
-            f"{'PASS' if result.passed else 'FAIL'} | {result.score:.1f} | "
+            f"{'PASS' if result.passed else 'FAIL'} | "
+            f"{'yes' if result.agent_completed else 'no'} | "
+            f"{'yes' if result.acceptance_passed else 'no'} | {result.score:.1f} | "
             f"{result.duration_seconds:.3f} | {result.model_calls} | "
             f"{result.tool_calls} | {result.failure_reason or ''} |"
         )
@@ -277,6 +281,8 @@ def write_summary(results: list[EvalResult], output_dir: Path) -> None:
                     "changed_files": result.changed_files,
                     "model_calls": result.model_calls,
                     "tool_calls": result.tool_calls,
+                    "agent_completed": result.agent_completed,
+                    "acceptance_passed": result.acceptance_passed,
                     "diagnosis": "",
                     "follow_up": "",
                 },

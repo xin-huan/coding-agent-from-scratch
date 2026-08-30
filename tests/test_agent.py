@@ -13,15 +13,36 @@ class FakeModel:
     def __init__(self, replies: list[ModelReply]) -> None:
         self.replies = iter(replies)
         self.received_messages: list[list[dict[str, object]]] = []
+        self.received_tools: list[list[dict[str, object]]] = []
 
     def complete(
         self, messages: list[dict[str, object]], tools: list[dict[str, object]]
     ) -> ModelReply:
         self.received_messages.append([message.copy() for message in messages])
+        self.received_tools.append(tools)
         return next(self.replies)
 
 
 class AgentTests(unittest.TestCase):
+    def test_allows_a_final_answer_after_the_last_tool_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(ToolCall("call-1", "list_files", {}),),
+                    ),
+                    ModelReply(content="检查完成。"),
+                ]
+            )
+
+            answer = Agent(model, Workspace(Path(temp_dir)), max_steps=1).run(
+                "检查项目"
+            )
+
+            self.assertEqual(answer, "检查完成。")
+            self.assertEqual(model.received_tools[1], [])
+
     def test_model_can_observe_a_tool_result_before_answering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
