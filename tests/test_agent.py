@@ -43,6 +43,32 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(answer, "检查完成。")
             self.assertEqual(model.received_tools[1], [])
 
+    def test_retries_when_final_answer_contains_tool_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(ToolCall("call-1", "list_files", {}),),
+                    ),
+                    ModelReply(
+                        content=(
+                            "检查完成。\n<｜DSML｜tool_calls>"
+                            "<｜DSML｜invoke name=run_command>"
+                        )
+                    ),
+                    ModelReply(content="检查完成，未修改文件。"),
+                ]
+            )
+
+            answer = Agent(model, Workspace(Path(temp_dir)), max_steps=1).run(
+                "检查项目"
+            )
+
+            self.assertEqual(answer, "检查完成，未修改文件。")
+            self.assertEqual(model.received_tools[1], [])
+            self.assertEqual(model.received_tools[2], [])
+
     def test_model_can_observe_a_tool_result_before_answering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -69,6 +95,68 @@ class AgentTests(unittest.TestCase):
                     and "README.md" in str(message.get("content"))
                     for message in second_request
                 )
+            )
+
+    def test_model_receives_updated_task_state_after_file_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "write_file",
+                                {"path": "result.txt", "content": "done\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="文件已创建。"),
+                ]
+            )
+
+            Agent(model, Workspace(Path(temp_dir)), max_steps=2).run("创建结果文件")
+
+            second_request = model.received_messages[1]
+            state_messages = [
+                str(message.get("content"))
+                for message in second_request
+                if message.get("role") == "system"
+                and "<task_state>" in str(message.get("content"))
+            ]
+            self.assertEqual(len(state_messages), 1)
+            self.assertIn("Phase: verify", state_messages[0])
+            self.assertIn("Modified files: result.txt", state_messages[0])
+            self.assertIn("Remaining action rounds: 1", state_messages[0])
+
+    def test_task_state_tells_model_to_stop_after_passing_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "check.py").write_text("print('ok')\n", encoding="utf-8")
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "run_command",
+                                {"argv": ["python", "check.py"]},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="验证通过。"),
+                ]
+            )
+
+            Agent(model, Workspace(root), max_steps=2).run("验证项目")
+
+            state = str(model.received_messages[1][-1]["content"])
+            self.assertIn("Phase: finalize", state)
+            self.assertIn("Latest command: passed (exit 0)", state)
+            self.assertIn(
+                "Return a final answer now. Do not call another tool",
+                state,
             )
 
     def test_records_each_agent_step_in_trace(self) -> None:

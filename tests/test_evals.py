@@ -9,7 +9,7 @@ from io import StringIO
 from pathlib import Path
 
 from evals.case import EvalCase, load_cases
-from evals.cli import main as eval_main
+from evals.cli import _build_parser, main as eval_main
 from evals.runner import EvalResult, evaluate_case, write_summary
 
 
@@ -17,6 +17,11 @@ CASES_DIR = Path(__file__).parents[1] / "evals" / "cases"
 
 
 class EvalCaseTests(unittest.TestCase):
+    def test_cli_defaults_to_enough_steps_for_multi_file_projects(self) -> None:
+        args = _build_parser().parse_args(["--run", "M3"])
+
+        self.assertEqual(args.max_steps, 16)
+
     def test_cli_lists_cases_without_running_a_model(self) -> None:
         output = StringIO()
 

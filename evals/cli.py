@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from coding_agent.agent import Agent
+from coding_agent.agent import DEFAULT_MAX_STEPS, Agent
 from coding_agent.config import ConfigError, Settings
 from coding_agent.model import DeepSeekModel
 from coding_agent.trace import JsonlTrace
@@ -32,7 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run case IDs, or 'all', using the configured model",
     )
     parser.add_argument("--repeat", type=int, default=1, help="Runs per selected case")
-    parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS_DIR)
     return parser
 
