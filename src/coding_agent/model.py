@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from coding_agent.agent import ModelReply, ToolCall
+from coding_agent.agent import ModelReply, TokenUsage, ToolCall
 from coding_agent.config import Settings
 
 
@@ -51,4 +51,22 @@ class DeepSeekModel:
                 )
             )
 
-        return ModelReply(content=message.content, tool_calls=tuple(tool_calls))
+        response_usage = getattr(response, "usage", None)
+        usage = None
+        if response_usage is not None:
+            usage = TokenUsage(
+                prompt_tokens=int(getattr(response_usage, "prompt_tokens", 0) or 0),
+                completion_tokens=int(
+                    getattr(response_usage, "completion_tokens", 0) or 0
+                ),
+                total_tokens=int(getattr(response_usage, "total_tokens", 0) or 0),
+                cache_hit_tokens=int(
+                    getattr(response_usage, "prompt_cache_hit_tokens", 0) or 0
+                ),
+            )
+
+        return ModelReply(
+            content=message.content,
+            tool_calls=tuple(tool_calls),
+            usage=usage,
+        )

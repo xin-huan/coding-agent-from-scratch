@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_agent.agent import Agent, ModelReply, TaskState, ToolCall
+from coding_agent.agent import Agent, ModelReply, TaskState, TokenUsage, ToolCall
 from coding_agent.checkpoint import CheckpointStore
+from coding_agent.context import ContextManager
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
 
@@ -71,6 +72,68 @@ def full_test_call(call_id: str) -> ToolCall:
 
 
 class AgentTests(unittest.TestCase):
+    def test_reports_real_model_token_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content="完成。",
+                        usage=TokenUsage(
+                            prompt_tokens=100,
+                            completion_tokens=20,
+                            total_tokens=120,
+                            cache_hit_tokens=40,
+                        ),
+                    )
+                ]
+            )
+
+            Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                on_event=events.append,
+            ).run("检查项目")
+
+            self.assertIn("[Token] 本次输入 100，输出 20；本次会话累计 120", events)
+
+    def test_compacts_long_tool_history_before_later_model_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "large.txt").write_text(
+                "".join(f"line {index:04d}\n" for index in range(3_000)),
+                encoding="utf-8",
+            )
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(f"read-{index}", "read_file", {"path": "large.txt"}),
+                        ),
+                    )
+                    for index in range(4)
+                ]
+                + [ModelReply(content="检查完成。")]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(root),
+                context_manager=ContextManager(max_characters=6_000, recent_turns=1),
+                on_event=events.append,
+            ).run("检查大文件")
+
+            self.assertEqual(answer, "检查完成。")
+            final_request = json.dumps(
+                model.received_messages[-1],
+                ensure_ascii=False,
+            )
+            self.assertIn("<history_summary>", final_request)
+            self.assertLess(len(final_request), 8_000)
+            self.assertTrue(any(event.startswith("[上下文]") for event in events))
+
     def test_from_scratch_project_is_planned_before_local_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             events: list[str] = []

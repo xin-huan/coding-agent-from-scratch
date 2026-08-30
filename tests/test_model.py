@@ -16,7 +16,16 @@ class FakeCompletions:
             function=SimpleNamespace(name="read_file", arguments='{"path":"README.md"}'),
         )
         message = SimpleNamespace(content=None, tool_calls=[tool_call])
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        usage = SimpleNamespace(
+            prompt_tokens=120,
+            completion_tokens=30,
+            total_tokens=150,
+            prompt_cache_hit_tokens=40,
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=usage,
+        )
 
 
 class DeepSeekModelTests(unittest.TestCase):
@@ -31,6 +40,9 @@ class DeepSeekModelTests(unittest.TestCase):
 
         self.assertEqual(reply.tool_calls[0].name, "read_file")
         self.assertEqual(reply.tool_calls[0].arguments, {"path": "README.md"})
+        self.assertEqual(reply.usage.prompt_tokens, 120)
+        self.assertEqual(reply.usage.completion_tokens, 30)
+        self.assertEqual(reply.usage.cache_hit_tokens, 40)
         self.assertIn("tools", completions.request)
 
     def test_omits_tools_from_a_finalization_request(self) -> None:

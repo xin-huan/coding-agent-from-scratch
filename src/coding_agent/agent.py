@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 from coding_agent.checkpoint import CheckpointError, CheckpointStore
+from coding_agent.context import ContextManager, ContextStats
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.trace import NullTrace, Trace
 from coding_agent.workspace import Workspace
@@ -170,6 +171,15 @@ class ToolCall:
 class ModelReply:
     content: str | None
     tool_calls: tuple[ToolCall, ...] = ()
+    usage: "TokenUsage | None" = None
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cache_hit_tokens: int = 0
 
 
 class Model(Protocol):
@@ -388,6 +398,7 @@ class Agent:
         on_event: Callable[[str], None] | None = None,
         trace: Trace | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self.model = model
         self.workspace = workspace
@@ -396,7 +407,11 @@ class Agent:
         self.on_event = on_event or (lambda _message: None)
         self.trace = trace or NullTrace()
         self.checkpoint_store = checkpoint_store
+        self.context_manager = context_manager or ContextManager()
         self._pending_task: str | None = None
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._cache_hit_tokens = 0
 
     @property
     def awaiting_clarification(self) -> bool:
@@ -621,6 +636,7 @@ class Agent:
                 error_type=type(error).__name__,
             )
             raise AgentError(f"Clarification check failed: {error}") from error
+        self._observe_usage(reply, step=0)
         self.trace.record(
             "model_reply",
             step=0,
@@ -724,10 +740,11 @@ class Agent:
             if step > 1:
                 self.on_event("[状态] 正在规划下一步")
             self.trace.record("model_request", step=step)
-            request_messages = [
-                *messages,
-                state.message(self.max_steps - step + 1),
-            ]
+            request_messages = self._build_request_context(
+                messages,
+                [state.message(self.max_steps - step + 1)],
+                step=step,
+            )
             reply = self._complete_action_request(request_messages, step)
 
             self.trace.record(
@@ -825,6 +842,57 @@ class Agent:
             error_prefix="Model request",
         )
 
+    def _build_request_context(
+        self,
+        messages: list[dict[str, object]],
+        tail_messages: list[dict[str, object]],
+        *,
+        step: int,
+    ) -> list[dict[str, object]]:
+        request = self.context_manager.build(messages, tail_messages)
+        stats: ContextStats = self.context_manager.last_stats
+        self.trace.record(
+            "context_built",
+            step=step,
+            original_characters=stats.original_characters,
+            sent_characters=stats.sent_characters,
+            saved_characters=stats.saved_characters,
+            summarized_messages=stats.summarized_messages,
+        )
+        if stats.summarized_messages:
+            percent = round(
+                stats.saved_characters * 100 / max(1, stats.original_characters)
+            )
+            self.on_event(
+                f"[上下文] 已压缩 {stats.summarized_messages} 条旧消息，"
+                f"本轮字符量减少约 {percent}%"
+            )
+        return request
+
+    def _observe_usage(self, reply: ModelReply, *, step: int) -> None:
+        usage = reply.usage
+        if usage is None:
+            return
+        self._prompt_tokens += usage.prompt_tokens
+        self._completion_tokens += usage.completion_tokens
+        self._cache_hit_tokens += usage.cache_hit_tokens
+        total = self._prompt_tokens + self._completion_tokens
+        self.on_event(
+            f"[Token] 本次输入 {usage.prompt_tokens}，输出 {usage.completion_tokens}；"
+            f"本次会话累计 {total}"
+        )
+        self.trace.record(
+            "token_usage",
+            step=step,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            cache_hit_tokens=usage.cache_hit_tokens,
+            cumulative_prompt_tokens=self._prompt_tokens,
+            cumulative_completion_tokens=self._completion_tokens,
+            cumulative_cache_hit_tokens=self._cache_hit_tokens,
+        )
+
     def _complete_model_request(
         self,
         request_messages: list[dict[str, object]],
@@ -836,7 +904,9 @@ class Agent:
         retry_messages = request_messages
         for attempt in range(2):
             try:
-                return self.model.complete(retry_messages, tools)
+                reply = self.model.complete(retry_messages, tools)
+                self._observe_usage(reply, step=step)
+                return reply
             except Exception as error:
                 if attempt == 0:
                     self.on_event("[状态] 模型响应异常，正在重试")
@@ -1020,11 +1090,14 @@ class Agent:
         reason: str,
     ) -> str:
         self.on_event("[状态] 正在整理结果")
-        request_messages = [
-            *messages,
-            state.message(0),
-            {"role": "system", "content": instruction},
-        ]
+        request_messages = self._build_request_context(
+            messages,
+            [
+                state.message(0),
+                {"role": "system", "content": instruction},
+            ],
+            step=step,
+        )
         self.trace.record(
             "model_request",
             step=step,
@@ -1040,6 +1113,7 @@ class Agent:
                 error_type=type(error).__name__,
             )
             raise AgentError(f"Final model request failed: {error}") from error
+        self._observe_usage(reply, step=step)
 
         self.trace.record(
             "model_reply",
@@ -1117,6 +1191,7 @@ class Agent:
                 error_type=type(error).__name__,
             )
             raise AgentError(f"Final model retry failed: {error}") from error
+        self._observe_usage(reply, step=step)
 
         self.trace.record(
             "model_reply",

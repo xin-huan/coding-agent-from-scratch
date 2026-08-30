@@ -11,6 +11,7 @@ from coding_agent.workspace import PROTECTED_DIRECTORIES, PROTECTED_FILES, Works
 
 IGNORED_DIRECTORIES = PROTECTED_DIRECTORIES
 MAX_WRITE_CHARACTERS = 100_000
+MAX_READ_CHARACTERS = 20_000
 
 
 class FileToolError(ValueError):
@@ -40,7 +41,12 @@ def list_files(workspace: Workspace, path: str = ".") -> str:
     return "\n".join(sorted(entries)) or "(empty directory)"
 
 
-def read_file(workspace: Workspace, path: str) -> str:
+def read_file(
+    workspace: Workspace,
+    path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
     file_path = workspace.resolve(path)
     _reject_protected_path(workspace, file_path, path)
     if not file_path.is_file():
@@ -53,7 +59,32 @@ def read_file(workspace: Workspace, path: str) -> str:
 
     if not lines:
         return "(empty file)"
-    return "\n".join(f"{number} | {line}" for number, line in enumerate(lines, start=1))
+    start = 1 if start_line is None else start_line
+    end = len(lines) if end_line is None else min(end_line, len(lines))
+    if start < 1 or end < start:
+        raise FileToolError("read_file line range is invalid")
+    if start > len(lines):
+        raise FileToolError(f"start_line exceeds file length: {len(lines)}")
+
+    rendered = [
+        f"{number} | {lines[number - 1]}"
+        for number in range(start, end + 1)
+    ]
+    result = "\n".join(rendered)
+    if len(result) <= MAX_READ_CHARACTERS:
+        return result
+
+    truncated = result[:MAX_READ_CHARACTERS]
+    if "\n" not in truncated:
+        return (
+            f"{truncated}\n... line {start} output truncated; "
+            "use search_text to locate a smaller relevant region ..."
+        )
+    last_complete_line = truncated.count("\n") + start
+    return (
+        f"{truncated}\n... file output truncated; "
+        f"continue with start_line={last_complete_line} ..."
+    )
 
 
 def search_text(

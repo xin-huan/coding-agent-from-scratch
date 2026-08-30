@@ -47,14 +47,27 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file with line numbers.",
+            "description": (
+                "Read a UTF-8 text file with line numbers. For large files, "
+                "request only the relevant line range to reduce context cost."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": FILE_PATH_DESCRIPTION,
-                    }
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional first line to read, starting at 1.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional final line to read, inclusive.",
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -166,9 +179,20 @@ class ToolRegistry:
 
         if name == "read_file":
             path = arguments.get("path")
+            start_line = arguments.get("start_line")
+            end_line = arguments.get("end_line")
             if not isinstance(path, str):
                 raise ValueError("read_file.path must be a string")
-            return read_file(self.workspace, path)
+            if start_line is not None and not isinstance(start_line, int):
+                raise ValueError("read_file.start_line must be an integer")
+            if end_line is not None and not isinstance(end_line, int):
+                raise ValueError("read_file.end_line must be an integer")
+            return read_file(
+                self.workspace,
+                path,
+                start_line=start_line,
+                end_line=end_line,
+            )
 
         if name == "search_text":
             query = arguments.get("query")

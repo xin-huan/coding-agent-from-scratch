@@ -36,6 +36,36 @@ class FilesystemToolTests(unittest.TestCase):
 
             self.assertEqual(result, "1 | first\n2 | second")
 
+    def test_reads_only_the_requested_line_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "notes.txt").write_text(
+                "first\nsecond\nthird\nfourth\n",
+                encoding="utf-8",
+            )
+
+            result = read_file(
+                Workspace(root),
+                "notes.txt",
+                start_line=2,
+                end_line=3,
+            )
+
+            self.assertEqual(result, "2 | second\n3 | third")
+
+    def test_large_file_read_is_truncated_with_continuation_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "large.txt").write_text(
+                "".join(f"line {index:04d}\n" for index in range(3_000)),
+                encoding="utf-8",
+            )
+
+            result = read_file(Workspace(root), "large.txt")
+
+            self.assertIn("file output truncated", result)
+            self.assertIn("start_line=", result)
+
     def test_file_listing_hides_local_secret_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
