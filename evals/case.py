@@ -8,7 +8,10 @@ from pathlib import Path
 
 
 CASE_ORDER = {case_id: index for index, case_id in enumerate(
-    ("C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2", "M1", "M2", "M3")
+    (
+        "C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2",
+        "M1", "M2", "M3", "M4",
+    )
 )}
 
 

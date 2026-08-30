@@ -14,7 +14,15 @@ from coding_agent.workspace import Workspace
 
 SYSTEM_PROMPT = """You are a coding agent working in one local project workspace.
 Inspect relevant files before editing. Prefer apply_patch for existing files.
-Run an appropriate test or command after making changes.
+For implementation tasks, create or update necessary automated tests and run
+the complete relevant test suite after making changes. The final report must
+include the exact usage or launch instructions and the real test result.
+For a new Python project, prefer standard-library unittest unless the workspace
+already uses an available test runner. Do not install a package only to run tests.
+When an execution plan is supplied in task state, follow it before making
+changes and use its acceptance checks to decide whether the task is complete.
+For read-only tasks, do not modify files merely to add tests. If meaningful
+automated testing is not possible, explain the validation performed instead.
 Never access secrets or paths outside the workspace.
 Use the runtime task state to avoid repeating completed work.
 If a missing user decision would make edits unsafe or lead to materially
@@ -62,6 +70,67 @@ PROCEED_TASK_DEFINITION = {
         },
     },
 }
+PLAN_TASK_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "plan_task",
+        "description": (
+            "Create a concise implementation plan and acceptance checklist "
+            "before building a new project from scratch."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Two to six concrete implementation steps.",
+                },
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Observable conditions required for completion.",
+                },
+                "test_strategy": {
+                    "type": "string",
+                    "description": "How the implementation will be tested.",
+                },
+            },
+            "required": ["steps", "acceptance", "test_strategy"],
+            "additionalProperties": False,
+        },
+    },
+}
+APPROVE_PLAN_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "approve_plan",
+        "description": "Approve a plan only when it preserves every explicit requirement.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+}
+REJECT_PLAN_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "reject_plan",
+        "description": "Reject a plan that omits or substitutes an explicit requirement.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Concise instructions for correcting the plan.",
+                }
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+    },
+}
 CLARIFICATION_GATE_PROMPT = """Decide whether this coding request is actionable.
 Call ask_user if the target, desired outcome, or an essential user choice is
 missing and different choices would lead to materially different edits.
@@ -69,6 +138,24 @@ Call proceed_task only when the request is concrete enough to begin safely.
 For example, 'optimize this project' requires clarification, while 'reduce list
 loading time without changing the public API' can proceed. Call exactly one of
 the two control actions and do not answer with plain text.
+"""
+PLANNING_GATE_PROMPT = """Plan this from-scratch software project before editing.
+Call ask_user only if an essential choice is missing and cannot be safely
+inferred. Otherwise call plan_task with a concise implementation plan,
+observable acceptance checks, and an automated test strategy. Include the
+launchable entry point and usage documentation in the plan. For a nontrivial
+application, keep the launch entry point thin and separate from testable core
+logic and the user-interface or external-I/O boundary. Do not call local tools
+or provide a plain-text answer yet.
+"""
+PLAN_REVIEW_PROMPT = """Review a proposed implementation plan against the
+original user request. Call approve_plan only if every explicit requirement is
+covered without substitution. Otherwise call reject_plan with a concise reason.
+Do not replace a requested interface (desktop GUI, web, CLI, or API), platform,
+feature, or user-adjustable setting with an easier alternative. Keep automated
+tests, usage documentation, and a thin launch entry point separate from the
+testable core and interface boundary in the corrected plan.
+Call exactly one control action and do not provide a plain-text answer.
 """
 
 
@@ -103,7 +190,11 @@ class TaskState:
     latest_command: str = "not run"
     last_error: str = "none"
     changes_pending_verification: bool = False
+    implementation_changes_pending: bool = False
     full_tests_passed: bool = False
+    plan: list[str] = field(default_factory=list)
+    acceptance: list[str] = field(default_factory=list)
+    test_strategy: str = "not planned"
 
     @property
     def ready_to_finalize(self) -> bool:
@@ -120,6 +211,8 @@ class TaskState:
             if path not in self.modified_files:
                 self.modified_files.append(path)
             self.changes_pending_verification = True
+            if str(path).lower().endswith(".py"):
+                self.implementation_changes_pending = True
             self.full_tests_passed = False
             self.phase = "verify"
             self.last_error = "none"
@@ -128,9 +221,10 @@ class TaskState:
                 self.latest_command = "passed (exit 0)"
                 if self.changes_pending_verification and _is_full_test_command(call):
                     self.changes_pending_verification = False
+                    self.implementation_changes_pending = False
                     self.full_tests_passed = True
                 if self.ready_to_finalize:
-                    self.phase = "finalize"
+                    self.phase = "review" if self.plan else "finalize"
                 elif self.changes_pending_verification:
                     self.phase = "verify"
                 else:
@@ -143,10 +237,13 @@ class TaskState:
 
     def message(self, remaining_rounds: int) -> dict[str, object]:
         files = ", ".join(self.modified_files) or "none"
+        plan = " | ".join(self.plan) or "none"
+        acceptance = " | ".join(self.acceptance) or "none"
         next_focus = {
             "inspect": "inspect only the files needed for the task",
             "verify": "run focused verification for the changes",
             "repair": "diagnose the latest failure before changing more code",
+            "review": "review every plan item and finish any missing deliverable",
             "finalize": (
                 "Return a final answer now. Do not call another tool unless an "
                 "explicit acceptance requirement remains unverified"
@@ -161,6 +258,9 @@ class TaskState:
                 f"Modified files: {files}\n"
                 f"Latest command: {self.latest_command}\n"
                 f"Last error: {self.last_error}\n"
+                f"Execution plan: {plan}\n"
+                f"Acceptance checks: {acceptance}\n"
+                f"Test strategy: {self.test_strategy}\n"
                 f"Remaining action rounds: {remaining_rounds}\n"
                 f"Next focus: {next_focus}\n"
                 "</task_state>"
@@ -175,7 +275,11 @@ class TaskState:
             "latest_command": self.latest_command,
             "last_error": self.last_error,
             "changes_pending_verification": self.changes_pending_verification,
+            "implementation_changes_pending": self.implementation_changes_pending,
             "full_tests_passed": self.full_tests_passed,
+            "plan": self.plan,
+            "acceptance": self.acceptance,
+            "test_strategy": self.test_strategy,
         }
 
     @classmethod
@@ -187,6 +291,14 @@ class TaskState:
             isinstance(path, str) for path in modified_files
         ):
             raise CheckpointError("Invalid checkpoint modified files")
+        plan = data.get("plan", [])
+        acceptance = data.get("acceptance", [])
+        if not isinstance(plan, list) or not all(isinstance(item, str) for item in plan):
+            raise CheckpointError("Invalid checkpoint plan")
+        if not isinstance(acceptance, list) or not all(
+            isinstance(item, str) for item in acceptance
+        ):
+            raise CheckpointError("Invalid checkpoint acceptance checks")
         return cls(
             goal=str(data.get("goal", "")),
             phase=str(data.get("phase", "inspect")),
@@ -196,7 +308,13 @@ class TaskState:
             changes_pending_verification=bool(
                 data.get("changes_pending_verification", False)
             ),
+            implementation_changes_pending=bool(
+                data.get("implementation_changes_pending", False)
+            ),
             full_tests_passed=bool(data.get("full_tests_passed", False)),
+            plan=plan,
+            acceptance=acceptance,
+            test_strategy=str(data.get("test_strategy", "not planned")),
         )
 
 
@@ -213,11 +331,7 @@ def _is_full_test_command(call: ToolCall) -> bool:
         return True
     if not program.startswith("python"):
         return False
-    return (
-        len(arguments) >= 4
-        and arguments[1:3] == ["-m", "unittest"]
-        and "discover" in arguments[3:]
-    )
+    return len(arguments) >= 3 and arguments[1:3] == ["-m", "unittest"]
 
 
 def _needs_clarification_gate(task: str) -> bool:
@@ -256,6 +370,14 @@ def _needs_clarification_gate(task: str) -> bool:
     )
 
 
+def _needs_creation_plan(task: str) -> bool:
+    normalized = " ".join(task.lower().split())
+    return (
+        ("从零" in normalized and any(word in normalized for word in ("创建", "搭建", "开发", "实现")))
+        or "from scratch" in normalized
+    )
+
+
 class Agent:
     def __init__(
         self,
@@ -287,6 +409,7 @@ class Agent:
                 f"User clarification:\n{task}"
             )
             self._pending_task = None
+        self.on_event("[状态] 正在分析任务")
         self.trace.record("task_start", task=task)
         messages: list[dict[str, object]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -299,9 +422,188 @@ class Agent:
             if question is not None:
                 return question
 
+        if _needs_creation_plan(task):
+            question = self._run_creation_planning_gate(task, state)
+            if question is not None:
+                return question
+
         return self._continue(task, messages, state, step=1)
 
+    def _run_creation_planning_gate(
+        self,
+        task: str,
+        state: TaskState,
+    ) -> str | None:
+        self.on_event("[状态] 正在制定实施计划")
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": PLANNING_GATE_PROMPT},
+            {"role": "user", "content": task},
+        ]
+        self.trace.record("model_request", step=0, planning_gate=True)
+        reply = self._complete_model_request(
+            messages,
+            [PLAN_TASK_DEFINITION, ASK_USER_DEFINITION],
+            step=0,
+            error_prefix="Planning",
+        )
+        self.trace.record(
+            "model_reply",
+            step=0,
+            content=reply.content,
+            tools=[call.name for call in reply.tool_calls],
+            planning_gate=True,
+        )
+
+        clarification = next(
+            (call for call in reply.tool_calls if call.name == "ask_user"),
+            None,
+        )
+        if clarification is not None:
+            question = str(clarification.arguments.get("question", "")).strip()
+            if not question:
+                raise AgentError("Model requested clarification without a question")
+            return self._pause_for_clarification(task, question, step=0)
+
+        plan_call = next(
+            (call for call in reply.tool_calls if call.name == "plan_task"),
+            None,
+        )
+        if plan_call is None or len(reply.tool_calls) != 1:
+            raise AgentError("Model did not provide a valid implementation plan")
+        steps, acceptance, test_strategy = self._parse_plan(plan_call)
+        steps, acceptance, test_strategy = self._review_creation_plan(
+            task,
+            steps,
+            acceptance,
+            test_strategy,
+        )
+
+        state.plan = steps
+        state.acceptance = acceptance
+        state.test_strategy = test_strategy
+        self.on_event(f"[计划] {' → '.join(steps)}")
+        self.trace.record(
+            "task_planned",
+            step=0,
+            steps=steps,
+            acceptance=acceptance,
+            test_strategy=test_strategy,
+        )
+        return None
+
+    def _review_creation_plan(
+        self,
+        task: str,
+        steps: list[str],
+        acceptance: list[str],
+        test_strategy: str,
+    ) -> tuple[list[str], list[str], str]:
+        self.on_event("[状态] 正在校验实施计划")
+        proposed_plan = json.dumps(
+            {
+                "steps": steps,
+                "acceptance": acceptance,
+                "test_strategy": test_strategy,
+            },
+            ensure_ascii=False,
+        )
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": PLAN_REVIEW_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Original request:\n{task}\n\n"
+                    f"Proposed plan:\n{proposed_plan}"
+                ),
+            },
+        ]
+        self.trace.record("model_request", step=0, plan_review=True)
+        reply = self._complete_model_request(
+            messages,
+            [APPROVE_PLAN_DEFINITION, REJECT_PLAN_DEFINITION],
+            step=0,
+            error_prefix="Plan review",
+        )
+        self.trace.record(
+            "model_reply",
+            step=0,
+            content=reply.content,
+            tools=[call.name for call in reply.tool_calls],
+            plan_review=True,
+        )
+        if len(reply.tool_calls) != 1:
+            raise AgentError("Model did not provide a valid plan review")
+        decision = reply.tool_calls[0]
+        if decision.name == "approve_plan":
+            self.trace.record("plan_approved", step=0)
+            return steps, acceptance, test_strategy
+        if decision.name == "reject_plan":
+            reason = str(decision.arguments.get("reason", "")).strip()
+            if not reason:
+                raise AgentError("Plan review rejected without a reason")
+            return self._revise_creation_plan(task, proposed_plan, reason)
+        raise AgentError("Model did not provide a valid plan review")
+
+    def _revise_creation_plan(
+        self,
+        task: str,
+        proposed_plan: str,
+        reason: str,
+    ) -> tuple[list[str], list[str], str]:
+        self.on_event("[状态] 正在修订实施计划")
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": PLANNING_GATE_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Original request:\n{task}\n\n"
+                    f"Rejected plan:\n{proposed_plan}\n\n"
+                    f"Review feedback:\n{reason}\n\n"
+                    "Return a corrected plan that addresses the feedback."
+                ),
+            },
+        ]
+        self.trace.record("model_request", step=0, plan_revision=True)
+        reply = self._complete_model_request(
+            messages,
+            [PLAN_TASK_DEFINITION],
+            step=0,
+            error_prefix="Plan revision",
+        )
+        self.trace.record(
+            "model_reply",
+            step=0,
+            content=reply.content,
+            tools=[call.name for call in reply.tool_calls],
+            plan_revision=True,
+        )
+        if len(reply.tool_calls) != 1 or reply.tool_calls[0].name != "plan_task":
+            raise AgentError("Model did not provide a corrected implementation plan")
+        self.trace.record("plan_revised", step=0, reason=reason)
+        return self._parse_plan(reply.tool_calls[0])
+
+    def _parse_plan(self, call: ToolCall) -> tuple[list[str], list[str], str]:
+        steps = self._string_list(call.arguments.get("steps"), "plan steps")
+        acceptance = self._string_list(
+            call.arguments.get("acceptance"),
+            "acceptance checks",
+        )
+        test_strategy = str(call.arguments.get("test_strategy", "")).strip()
+        if not 2 <= len(steps) <= 6 or not acceptance or not test_strategy:
+            raise AgentError("Model provided an incomplete implementation plan")
+        return steps, acceptance, test_strategy
+
+    @staticmethod
+    def _string_list(value: object, label: str) -> list[str]:
+        if not isinstance(value, list):
+            raise AgentError(f"Invalid {label}")
+        items = [str(item).strip() for item in value]
+        if not all(items):
+            raise AgentError(f"Invalid {label}")
+        return items
+
     def _run_clarification_gate(self, task: str) -> str | None:
+        self.on_event("[状态] 正在确认需求")
         messages: list[dict[str, object]] = [
             {"role": "system", "content": CLARIFICATION_GATE_PROMPT},
             {"role": "user", "content": task},
@@ -341,6 +643,7 @@ class Agent:
         raise AgentError("Model did not make a valid clarification decision")
 
     def resume(self) -> str:
+        self.on_event("[状态] 正在恢复任务")
         if self.checkpoint_store is None:
             raise AgentError("Checkpoint recovery is not configured")
         try:
@@ -413,28 +716,19 @@ class Agent:
                 pending_calls,
                 start_index=next_call_index,
             )
-            if state.ready_to_finalize:
+            if state.ready_to_finalize and not state.plan:
                 return self._finalize_after_verification(messages, state, step + 1)
             step += 1
 
         while step <= self.max_steps:
+            if step > 1:
+                self.on_event("[状态] 正在规划下一步")
             self.trace.record("model_request", step=step)
             request_messages = [
                 *messages,
                 state.message(self.max_steps - step + 1),
             ]
-            try:
-                reply = self.model.complete(
-                    request_messages,
-                    [*self.tools.definitions, ASK_USER_DEFINITION],
-                )
-            except Exception as error:
-                self.trace.record(
-                    "task_error",
-                    step=step,
-                    error_type=type(error).__name__,
-                )
-                raise AgentError(f"Model request failed: {error}") from error
+            reply = self._complete_action_request(request_messages, step)
 
             self.trace.record(
                 "model_reply",
@@ -459,6 +753,29 @@ class Agent:
                 return self._pause_for_clarification(task, question, step=step)
             if not reply.tool_calls:
                 if reply.content:
+                    if state.implementation_changes_pending:
+                        self.trace.record(
+                            "completion_deferred",
+                            step=step,
+                            reason="implementation_not_verified",
+                        )
+                        messages.extend(
+                            [
+                                {"role": "assistant", "content": reply.content},
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Python code has changed but the complete "
+                                        "relevant test suite has not passed since "
+                                        "the latest change. Continue with tools to "
+                                        "add or update tests as needed and run the "
+                                        "full suite before reporting completion."
+                                    ),
+                                },
+                            ]
+                        )
+                        step += 1
+                        continue
                     if self._contains_tool_protocol(reply.content):
                         return self._retry_final_answer(
                             request_messages,
@@ -481,7 +798,7 @@ class Agent:
                 reply.tool_calls,
             )
 
-            if state.ready_to_finalize:
+            if state.ready_to_finalize and not state.plan:
                 return self._finalize_after_verification(messages, state, step + 1)
             step += 1
 
@@ -496,6 +813,59 @@ class Agent:
             reason="tool_budget_exhausted",
         )
 
+    def _complete_action_request(
+        self,
+        request_messages: list[dict[str, object]],
+        step: int,
+    ) -> ModelReply:
+        return self._complete_model_request(
+            request_messages,
+            [*self.tools.definitions, ASK_USER_DEFINITION],
+            step=step,
+            error_prefix="Model request",
+        )
+
+    def _complete_model_request(
+        self,
+        request_messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+        *,
+        step: int,
+        error_prefix: str,
+    ) -> ModelReply:
+        retry_messages = request_messages
+        for attempt in range(2):
+            try:
+                return self.model.complete(retry_messages, tools)
+            except Exception as error:
+                if attempt == 0:
+                    self.on_event("[状态] 模型响应异常，正在重试")
+                    self.trace.record(
+                        "model_retry",
+                        step=step,
+                        error_type=type(error).__name__,
+                        error=str(error),
+                    )
+                    retry_messages = [
+                        *request_messages,
+                        {
+                            "role": "system",
+                            "content": (
+                                "The previous model response could not be processed: "
+                                f"{error}. Retry this same step. If calling a tool, "
+                                "return arguments that exactly match its JSON schema."
+                            ),
+                        },
+                    ]
+                    continue
+                self.trace.record(
+                    "task_error",
+                    step=step,
+                    error_type=type(error).__name__,
+                )
+                raise AgentError(f"{error_prefix} failed after retry: {error}") from error
+        raise AssertionError("unreachable")
+
     def _execute_tool_calls(
         self,
         task: str,
@@ -508,6 +878,15 @@ class Agent:
     ) -> None:
         for index in range(start_index, len(calls)):
             call = calls[index]
+            if call.name in {"list_files", "read_file", "search_text"}:
+                self.on_event("[状态] 正在检查项目")
+            elif call.name in {"write_file", "apply_patch"}:
+                path = str(call.arguments.get("path", "项目文件"))
+                self.on_event(f"[状态] 正在修改 {path}")
+            elif _is_full_test_command(call):
+                self.on_event("[状态] 正在运行测试")
+            elif call.name == "run_command":
+                self.on_event("[状态] 正在执行验证命令")
             self.on_event(f"[工具] {call.name}")
             self.trace.record(
                 "tool_start",
@@ -522,6 +901,11 @@ class Agent:
                 success = False
             else:
                 success = True
+            if _is_full_test_command(call):
+                if "Exit code: 0" in result:
+                    self.on_event("[状态] 测试通过，正在整理结果")
+                else:
+                    self.on_event("[状态] 测试失败，正在分析原因")
             state.update(call, result, success)
             self.trace.record(
                 "tool_result",
@@ -559,7 +943,8 @@ class Agent:
             (
                 "Full test suite passed after the latest file changes. "
                 "Do not call more tools. Give a concise, honest final "
-                "report in Chinese based on the completed work and tests."
+                "report in Chinese based on the completed work and tests. "
+                "Include exact usage or launch instructions for the result."
             ),
             reason="verification_passed",
         )
@@ -610,6 +995,7 @@ class Agent:
         *,
         step: int,
     ) -> str:
+        self.on_event("[状态] 需要补充信息")
         self._pending_task = task
         self._save_clarification_checkpoint(task, question)
         self.trace.record(
@@ -633,6 +1019,7 @@ class Agent:
         *,
         reason: str,
     ) -> str:
+        self.on_event("[状态] 正在整理结果")
         request_messages = [
             *messages,
             state.message(0),

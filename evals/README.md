@@ -11,6 +11,7 @@
 - M1：跨 CLI、Service 和测试增加关键词筛选。
 - M2：先复现已有失败测试，再修复折扣边界 Bug。
 - M3：从零创建包含五个职责模块的记账 CLI。
+- M4：使用自然语言需求从零创建番茄钟桌面 App，工程要求由 Agent 主动完成。
 
 外置验收器和参考答案不会复制到 Agent 工作区。每次运行都使用新的工作区副本。
 
@@ -35,7 +36,7 @@
 # 3 题中等难度基线
 .\.venv\Scripts\python.exe -m evals --run M1 M2 M3
 
-# 全部 11 题
+# 全部 12 题
 .\.venv\Scripts\python.exe -m evals --run all
 
 # 最终稳定性评测，共 22 次

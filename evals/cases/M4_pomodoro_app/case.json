@@ -1,0 +1,8 @@
+{
+  "id": "M4",
+  "category": "hard_create",
+  "title": "从零创建番茄钟桌面 App",
+  "task_file": "task.md",
+  "workspace": null,
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 30}
+}

@@ -92,7 +92,7 @@ class EvalCaseTests(unittest.TestCase):
             [case.id for case in cases],
             [
                 "C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2",
-                "M1", "M2", "M3",
+                "M1", "M2", "M3", "M4",
             ],
         )
         self.assertTrue(all(case.task.strip() for case in cases))
@@ -445,6 +445,68 @@ class FilterTests(unittest.TestCase):
                 case,
                 create_expense_project,
                 Path(temp_dir) / "M3",
+            )
+
+        self.assertTrue(result.passed, result.grader_output)
+
+    def test_m4_grader_accepts_a_testable_pomodoro_desktop_app(self) -> None:
+        case = {case.id: case for case in load_cases(CASES_DIR)}["M4"]
+
+        def create_pomodoro(workspace: Path, _task: str, _trace: Path) -> str:
+            files = {
+                "pomodoro/__init__.py": "",
+                "pomodoro/core.py": (
+                    "class Timer:\n"
+                    "    def __init__(self):\n"
+                    "        self.phase = 'work'\n"
+                    "        self.remaining = 1500\n"
+                    "        self.running = False\n"
+                    "    def start(self): self.running = True\n"
+                    "    def pause(self): self.running = False\n"
+                    "    def reset(self): self.remaining = 1500\n"
+                    "    def skip(self): self.phase = 'break' if self.phase == 'work' else 'work'\n"
+                    "    def tick(self): self.remaining = max(0, self.remaining - 1)\n"
+                ),
+                "pomodoro/ui.py": (
+                    "import tkinter as tk\n"
+                    "from .core import Timer\n"
+                    "class App:\n"
+                    "    def __init__(self, root):\n"
+                    "        self.timer = Timer()\n"
+                    "        self.work_entry = tk.Spinbox(root, from_=1, to=60)\n"
+                    "        self.break_entry = tk.Spinbox(root, from_=1, to=30)\n"
+                    "        self.remaining_label = tk.Label(root, text='remaining')\n"
+                    "        for text, command in [('start', self.timer.start), ('pause', self.timer.pause), ('reset', self.timer.reset), ('skip', self.timer.skip)]:\n"
+                    "            tk.Button(root, text=text, command=command).pack()\n"
+                    "        root.after(1000, self.update)\n"
+                    "    def update(self): self.timer.tick()\n"
+                ),
+                "pomodoro/__main__.py": (
+                    "import tkinter as tk\n"
+                    "from .ui import App\n"
+                    "root = tk.Tk()\nApp(root)\nroot.mainloop()\n"
+                ),
+                "README.md": "# Pomodoro\n\nRun with `python -m pomodoro`.\n",
+                "tests/test_core.py": (
+                    "import unittest\nfrom pomodoro.core import Timer\n"
+                    "class TimerTests(unittest.TestCase):\n"
+                    "    def test_start(self):\n        t=Timer(); t.start(); self.assertTrue(t.running)\n"
+                    "    def test_pause(self):\n        t=Timer(); t.pause(); self.assertFalse(t.running)\n"
+                    "    def test_reset(self):\n        t=Timer(); t.remaining=1; t.reset(); self.assertEqual(t.remaining,1500)\n"
+                    "    def test_skip(self):\n        t=Timer(); t.skip(); self.assertEqual(t.phase,'break')\n"
+                ),
+            }
+            for relative_path, content in files.items():
+                path = workspace / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            return "Created and tested. Run with python -m pomodoro."
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = evaluate_case(
+                case,
+                create_pomodoro,
+                Path(temp_dir) / "M4",
             )
 
         self.assertTrue(result.passed, result.grader_output)

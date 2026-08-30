@@ -4,14 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_agent.agent import Agent, ModelReply, ToolCall
+from coding_agent.agent import Agent, ModelReply, TaskState, ToolCall
 from coding_agent.checkpoint import CheckpointStore
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
 
 
 class FakeModel:
-    def __init__(self, replies: list[ModelReply]) -> None:
+    def __init__(self, replies: list[ModelReply | Exception]) -> None:
         self.replies = iter(replies)
         self.received_messages: list[list[dict[str, object]]] = []
         self.received_tools: list[list[dict[str, object]]] = []
@@ -21,7 +21,10 @@ class FakeModel:
     ) -> ModelReply:
         self.received_messages.append([message.copy() for message in messages])
         self.received_tools.append(tools)
-        return next(self.replies)
+        reply = next(self.replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
 class InterruptingCheckpointStore(CheckpointStore):
@@ -68,6 +71,185 @@ def full_test_call(call_id: str) -> ToolCall:
 
 
 class AgentTests(unittest.TestCase):
+    def test_from_scratch_project_is_planned_before_local_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "plan-1",
+                                "plan_task",
+                                {
+                                    "steps": ["设计模块", "实现功能", "运行测试"],
+                                    "acceptance": ["应用可以启动", "测试全部通过"],
+                                    "test_strategy": "为核心逻辑编写单元测试",
+                                },
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(ToolCall("review-1", "approve_plan", {}),),
+                    ),
+                    ModelReply(content="计划已确认，尚未修改文件。"),
+                ]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                on_event=events.append,
+            ).run("请从零创建一个示例应用")
+
+            self.assertEqual(answer, "计划已确认，尚未修改文件。")
+            planning_tools = [
+                tool["function"]["name"] for tool in model.received_tools[0]
+            ]
+            self.assertEqual(planning_tools, ["plan_task", "ask_user"])
+            self.assertIn(
+                "keep the launch entry point thin",
+                str(model.received_messages[0][0]["content"]),
+            )
+            task_state = str(model.received_messages[2][-1]["content"])
+            self.assertIn("设计模块 | 实现功能 | 运行测试", task_state)
+            self.assertIn("为核心逻辑编写单元测试", task_state)
+            self.assertTrue(any(event.startswith("[计划]") for event in events))
+
+    def test_plan_review_can_restore_an_explicit_interface_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "plan-1",
+                                "plan_task",
+                                {
+                                    "steps": ["实现核心逻辑", "提供 CLI"],
+                                    "acceptance": ["命令行可以运行"],
+                                    "test_strategy": "测试核心逻辑",
+                                },
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "review-1",
+                                "reject_plan",
+                                {"reason": "必须保留用户要求的桌面 GUI"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "revision-1",
+                                "plan_task",
+                                {
+                                    "steps": ["实现核心逻辑", "实现桌面 GUI", "运行测试"],
+                                    "acceptance": ["桌面窗口可以启动", "测试通过"],
+                                    "test_strategy": "测试核心逻辑并验证 GUI 可启动",
+                                },
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="计划已修正。"),
+                ]
+            )
+
+            answer = Agent(model, Workspace(Path(temp_dir))).run(
+                "请从零创建一个桌面应用"
+            )
+
+            self.assertEqual(answer, "计划已修正。")
+            task_state = str(model.received_messages[3][-1]["content"])
+            self.assertIn("实现桌面 GUI", task_state)
+            self.assertNotIn("提供 CLI", task_state)
+
+    def test_planned_project_reviews_missing_deliverables_after_tests_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root)
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "plan-1",
+                                "plan_task",
+                                {
+                                    "steps": ["实现应用", "编写 README", "运行测试"],
+                                    "acceptance": ["测试通过", "包含使用说明"],
+                                    "test_strategy": "运行 unittest",
+                                },
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(ToolCall("review-1", "approve_plan", {}),),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "write-1",
+                                "write_file",
+                                {"path": "app.py", "content": "VALUE = 1\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content=None, tool_calls=(full_test_call("test-1"),)),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "write-2",
+                                "write_file",
+                                {"path": "README.md", "content": "python app.py\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="应用、测试和使用说明均已完成。"),
+                ]
+            )
+
+            answer = Agent(model, Workspace(root)).run("请从零创建一个 Python 应用")
+
+            self.assertEqual(answer, "应用、测试和使用说明均已完成。")
+            self.assertTrue((root / "README.md").exists())
+            state_after_tests = str(model.received_messages[4][-1]["content"])
+            self.assertIn("Phase: review", state_after_tests)
+
+    def test_retries_once_when_model_returns_invalid_tool_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ValueError("Invalid arguments for tool run_command"),
+                    ModelReply(content="检查完成。"),
+                ]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                on_event=events.append,
+            ).run("检查项目")
+
+            self.assertEqual(answer, "检查完成。")
+            self.assertEqual(len(model.received_messages), 2)
+            self.assertIn("exactly match its JSON schema", str(model.received_messages[1]))
+            self.assertIn("[状态] 模型响应异常，正在重试", events)
+
     def test_resumes_after_the_last_completed_tool_without_repeating_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -115,8 +297,14 @@ class AgentTests(unittest.TestCase):
             answer = resumed_agent.resume()
 
             self.assertEqual(answer, "两个文件均已创建。")
-            self.assertEqual(interrupted_events, ["[工具] write_file"])
-            self.assertEqual(resumed_events, ["[工具] write_file"])
+            self.assertEqual(
+                [event for event in interrupted_events if event.startswith("[工具]")],
+                ["[工具] write_file"],
+            )
+            self.assertEqual(
+                [event for event in resumed_events if event.startswith("[工具]")],
+                ["[工具] write_file"],
+            )
             self.assertEqual((root / "first.txt").read_text(), "first\n")
             self.assertEqual((root / "second.txt").read_text(), "second\n")
             self.assertFalse(checkpoint_path.exists())
@@ -332,6 +520,19 @@ class AgentTests(unittest.TestCase):
             self.assertIn("Latest command: passed (exit 0)", state)
             self.assertNotIn("Return a final answer now", state)
 
+    def test_explicit_unittest_module_counts_as_full_verification(self) -> None:
+        call = ToolCall(
+            "call-1",
+            "run_command",
+            {"argv": ["python", "-m", "unittest", "-v", "test_app.py"]},
+        )
+        state = TaskState("创建 Python 应用", changes_pending_verification=True)
+
+        state.update(call, "Exit code: 0", success=True)
+
+        self.assertTrue(state.full_tests_passed)
+        self.assertTrue(state.ready_to_finalize)
+
     def test_finalizes_without_tools_after_changed_files_pass_full_tests(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -366,6 +567,13 @@ class AgentTests(unittest.TestCase):
                     for message in model.received_messages[2]
                 )
             )
+            initial_prompt = str(model.received_messages[0][0]["content"])
+            final_request = "\n".join(
+                str(message.get("content")) for message in model.received_messages[2]
+            )
+            self.assertIn("create or update necessary automated tests", initial_prompt)
+            self.assertIn("standard-library unittest", initial_prompt)
+            self.assertIn("exact usage or launch instructions", final_request)
 
     def test_passing_tests_before_a_change_do_not_trigger_finalization(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -424,6 +632,37 @@ class AgentTests(unittest.TestCase):
 
             self.assertEqual(answer, "测试仍然失败。")
             self.assertNotEqual(model.received_tools[2], [])
+
+    def test_does_not_accept_unverified_code_changes_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root)
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "write_file",
+                                {"path": "app.py", "content": "VALUE = 1\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="代码已经完成。"),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(full_test_call("call-2"),),
+                    ),
+                    ModelReply(content="代码完成，完整测试通过。"),
+                ]
+            )
+
+            answer = Agent(model, Workspace(root)).run("创建 Python 模块")
+
+            self.assertEqual(answer, "代码完成，完整测试通过。")
+            self.assertNotEqual(model.received_tools[2], [])
+            self.assertEqual(model.received_tools[3], [])
 
     def test_uses_runtime_summary_when_verified_final_answer_stays_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -494,6 +733,44 @@ class AgentTests(unittest.TestCase):
                     "task_complete",
                 }.issubset(events)
             )
+
+    def test_reports_live_progress_for_inspection_editing_and_testing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root)
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(ToolCall("call-1", "list_files", {}),),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-2",
+                                "write_file",
+                                {"path": "app.py", "content": "VALUE = 1\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(full_test_call("call-3"),),
+                    ),
+                    ModelReply(content="完成。"),
+                ]
+            )
+
+            Agent(model, Workspace(root), on_event=events.append).run("创建模块")
+
+            statuses = [event for event in events if event.startswith("[状态]")]
+            self.assertIn("[状态] 正在分析任务", statuses)
+            self.assertIn("[状态] 正在检查项目", statuses)
+            self.assertIn("[状态] 正在修改 app.py", statuses)
+            self.assertIn("[状态] 正在运行测试", statuses)
+            self.assertIn("[状态] 测试通过，正在整理结果", statuses)
 
     def test_agent_can_modify_fixture_and_run_its_tests(self) -> None:
         fixture = Path(__file__).parent / "fixtures" / "todo_project"
