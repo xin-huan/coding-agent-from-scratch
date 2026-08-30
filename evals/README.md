@@ -8,6 +8,9 @@
 - F1-F2：增加幂运算和删除任务功能。
 - B1-B2：修复分页边界和 JSON 持久化问题。
 - E1-E2：只读解释分层项目和带配置的项目。
+- M1：跨 CLI、Service 和测试增加关键词筛选。
+- M2：先复现已有失败测试，再修复折扣边界 Bug。
+- M3：从零创建包含五个职责模块的记账 CLI。
 
 外置验收器和参考答案不会复制到 Agent 工作区。每次运行都使用新的工作区副本。
 
@@ -26,10 +29,16 @@
 # 单题试运行
 .\.venv\Scripts\python.exe -m evals --run C1
 
-# 8 题基线
+# 8 题核心基线
+.\.venv\Scripts\python.exe -m evals --run C1 C2 F1 F2 B1 B2 E1 E2
+
+# 3 题中等难度基线
+.\.venv\Scripts\python.exe -m evals --run M1 M2 M3
+
+# 全部 11 题
 .\.venv\Scripts\python.exe -m evals --run all
 
-# 最终稳定性评测，共 16 次
+# 最终稳定性评测，共 22 次
 .\.venv\Scripts\python.exe -m evals --run all --repeat 2
 ```
 

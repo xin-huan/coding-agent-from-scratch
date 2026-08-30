@@ -1,0 +1,9 @@
+{
+  "id": "M2",
+  "category": "medium_debug",
+  "title": "根据失败测试修复折扣边界",
+  "task_file": "task.md",
+  "workspace": "workspace",
+  "expected_baseline": "failing",
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 20}
+}

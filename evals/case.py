@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 CASE_ORDER = {case_id: index for index, case_id in enumerate(
-    ("C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2")
+    ("C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2", "M1", "M2", "M3")
 )}
 
 
@@ -21,6 +21,7 @@ class EvalCase:
     root: Path
     workspace: str | None
     grader: dict[str, object]
+    expected_baseline: str = "passing"
 
 
 def load_cases(cases_dir: Path) -> list[EvalCase]:
@@ -37,7 +38,7 @@ def load_cases(cases_dir: Path) -> list[EvalCase]:
                 root=root,
                 workspace=data.get("workspace"),
                 grader=data["grader"],
+                expected_baseline=data.get("expected_baseline", "passing"),
             )
         )
     return sorted(cases, key=lambda case: CASE_ORDER[case.id])
-

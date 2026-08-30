@@ -31,6 +31,8 @@ class EvalCaseTests(unittest.TestCase):
         for case in load_cases(CASES_DIR):
             if case.workspace is None:
                 continue
+            if case.expected_baseline != "passing":
+                continue
             workspace = case.root / case.workspace
             tests_dir = workspace / "project_tests"
             if not tests_dir.exists():
@@ -54,12 +56,39 @@ class EvalCaseTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_m2_starts_with_a_reproducible_failing_test(self) -> None:
+        case = {case.id: case for case in load_cases(CASES_DIR)}["M2"]
+        workspace = case.root / str(case.workspace)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "project_tests",
+                "-v",
+            ],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test_threshold_order_receives_discount", result.stderr)
+
     def test_loads_the_fixed_eval_case_manifest(self) -> None:
         cases = load_cases(CASES_DIR)
 
         self.assertEqual(
             [case.id for case in cases],
-            ["C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2"],
+            [
+                "C1", "C2", "F1", "F2", "B1", "B2", "E1", "E2",
+                "M1", "M2", "M3",
+            ],
         )
         self.assertTrue(all(case.task.strip() for case in cases))
 
@@ -246,6 +275,172 @@ class DeleteTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             result = evaluate_case(case, add_delete, Path(temp_dir) / "F2")
+
+        self.assertTrue(result.passed, result.grader_output)
+
+    def test_m1_grader_accepts_cross_module_filter_feature(self) -> None:
+        case = {case.id: case for case in load_cases(CASES_DIR)}["M1"]
+
+        def add_filter(workspace: Path, _task: str, _trace: Path) -> str:
+            service = workspace / "todo_app" / "service.py"
+            service.write_text(
+                service.read_text(encoding="utf-8").replace(
+                    "    def list_tasks(self) -> list[Task]:\n"
+                    "        return self.repository.load()\n",
+                    "    def list_tasks(self, keyword: str | None = None) -> list[Task]:\n"
+                    "        tasks = self.repository.load()\n"
+                    "        query = (keyword or '').strip().casefold()\n"
+                    "        if not query:\n"
+                    "            return tasks\n"
+                    "        return [task for task in tasks if query in task['title'].casefold()]\n",
+                ),
+                encoding="utf-8",
+            )
+            cli = workspace / "todo_app" / "cli.py"
+            cli.write_text(
+                cli.read_text(encoding="utf-8")
+                .replace(
+                    '    commands.add_parser("list")\n',
+                    '    listing = commands.add_parser("list")\n'
+                    '    listing.add_argument("--keyword")\n',
+                )
+                .replace(
+                    "        for task in service.list_tasks():\n",
+                    "        for task in service.list_tasks(args.keyword):\n",
+                ),
+                encoding="utf-8",
+            )
+            (workspace / "project_tests" / "test_filter.py").write_text(
+                """import tempfile
+import unittest
+from pathlib import Path
+
+from todo_app.repository import TaskRepository
+from todo_app.service import TodoService
+
+
+class FilterTests(unittest.TestCase):
+    def test_filters_keyword(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = TodoService(TaskRepository(Path(temp_dir) / "tasks.json"))
+            service.add("Read code")
+            self.assertEqual(len(service.list_tasks("CODE")), 1)
+""",
+                encoding="utf-8",
+            )
+            return "Completed"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = evaluate_case(case, add_filter, Path(temp_dir) / "M1")
+
+        self.assertTrue(result.passed, result.grader_output)
+
+    def test_m2_grader_accepts_minimal_boundary_fix(self) -> None:
+        case = {case.id: case for case in load_cases(CASES_DIR)}["M2"]
+
+        def fix_boundary(workspace: Path, _task: str, _trace: Path) -> str:
+            pricing = workspace / "order_app" / "pricing.py"
+            pricing.write_text(
+                pricing.read_text(encoding="utf-8").replace(
+                    "subtotal > DISCOUNT_THRESHOLD",
+                    "subtotal >= DISCOUNT_THRESHOLD",
+                ),
+                encoding="utf-8",
+            )
+            return "Reproduced the failure, fixed the boundary, and tests pass."
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = evaluate_case(case, fix_boundary, Path(temp_dir) / "M2")
+
+        self.assertTrue(result.passed, result.grader_output)
+
+    def test_m3_grader_accepts_five_module_expense_project(self) -> None:
+        case = {case.id: case for case in load_cases(CASES_DIR)}["M3"]
+
+        def create_expense_project(workspace: Path, _task: str, _trace: Path) -> str:
+            files = {
+                "expense_tracker/__init__.py": '"""Expense tracker."""\n',
+                "expense_tracker/models.py": (
+                    '"""Expense data shape."""\n\n'
+                    "from typing import TypedDict\n\n"
+                    "class Expense(TypedDict):\n"
+                    "    id: int\n    amount: float\n    description: str\n"
+                ),
+                "expense_tracker/storage.py": (
+                    "import json\nfrom pathlib import Path\n\n"
+                    "def load(path: Path):\n"
+                    "    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else []\n\n"
+                    "def save(path: Path, expenses):\n"
+                    "    path.write_text(json.dumps(expenses) + '\\n', encoding='utf-8')\n"
+                ),
+                "expense_tracker/service.py": (
+                    "def add_expense(expenses, amount, description):\n"
+                    "    description = description.strip()\n"
+                    "    if amount <= 0 or not description:\n"
+                    "        raise ValueError('amount and description are required')\n"
+                    "    item = {'id': len(expenses) + 1, 'amount': amount, 'description': description}\n"
+                    "    return [*expenses, item]\n\n"
+                    "def total(expenses):\n"
+                    "    return sum(float(item['amount']) for item in expenses)\n"
+                ),
+                "expense_tracker/cli.py": (
+                    "import argparse\nfrom pathlib import Path\n"
+                    "from expense_tracker.service import add_expense, total\n"
+                    "from expense_tracker.storage import load, save\n\n"
+                    "def main(argv=None):\n"
+                    "    parser = argparse.ArgumentParser()\n"
+                    "    parser.add_argument('--data', type=Path, required=True)\n"
+                    "    commands = parser.add_subparsers(dest='command', required=True)\n"
+                    "    add = commands.add_parser('add')\n"
+                    "    add.add_argument('amount', type=float)\n"
+                    "    add.add_argument('description')\n"
+                    "    commands.add_parser('list')\n"
+                    "    commands.add_parser('total')\n"
+                    "    args = parser.parse_args(argv)\n"
+                    "    expenses = load(args.data)\n"
+                    "    try:\n"
+                    "        if args.command == 'add':\n"
+                    "            expenses = add_expense(expenses, args.amount, args.description)\n"
+                    "            save(args.data, expenses)\n"
+                    "        elif args.command == 'list':\n"
+                    "            for item in expenses:\n"
+                    "                print(f\"{item['id']} | {float(item['amount']):.2f} | {item['description']}\")\n"
+                    "        else:\n"
+                    "            print(f'{total(expenses):.2f}')\n"
+                    "    except ValueError as error:\n"
+                    "        parser.error(str(error))\n"
+                    "    return 0\n"
+                ),
+                "expense_tracker/__main__.py": (
+                    "from expense_tracker.cli import main\n\nraise SystemExit(main())\n"
+                ),
+                "README.md": "# Expense Tracker\n\nRun with `python -m expense_tracker`.\n",
+                "tests/test_expense.py": (
+                    "import unittest\n"
+                    "from expense_tracker.service import add_expense, total\n\n"
+                    "class ExpenseTests(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(add_expense([], 1, 'A')[0]['id'], 1)\n"
+                    "    def test_total(self):\n"
+                    "        self.assertEqual(total([{'amount': 2}]), 2)\n"
+                    "    def test_amount(self):\n"
+                    "        with self.assertRaises(ValueError): add_expense([], 0, 'A')\n"
+                    "    def test_description(self):\n"
+                    "        with self.assertRaises(ValueError): add_expense([], 1, ' ')\n"
+                ),
+            }
+            for relative_path, content in files.items():
+                path = workspace / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            return "Completed"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = evaluate_case(
+                case,
+                create_expense_project,
+                Path(temp_dir) / "M3",
+            )
 
         self.assertTrue(result.passed, result.grader_output)
 

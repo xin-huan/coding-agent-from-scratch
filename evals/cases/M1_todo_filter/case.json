@@ -1,0 +1,8 @@
+{
+  "id": "M1",
+  "category": "medium_feature",
+  "title": "跨模块增加 TODO 关键词筛选",
+  "task_file": "task.md",
+  "workspace": "workspace",
+  "grader": {"kind": "python", "path": "grader.py", "timeout": 25}
+}
