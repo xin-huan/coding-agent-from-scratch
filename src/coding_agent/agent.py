@@ -57,10 +57,16 @@ class TaskState:
     modified_files: list[str] = field(default_factory=list)
     latest_command: str = "not run"
     last_error: str = "none"
+    changes_pending_verification: bool = False
+    full_tests_passed: bool = False
+
+    @property
+    def ready_to_finalize(self) -> bool:
+        return self.full_tests_passed and not self.changes_pending_verification
 
     def update(self, call: ToolCall, result: str, success: bool) -> None:
         if not success:
-            self.phase = "repair"
+            self.phase = "finalize" if self.ready_to_finalize else "repair"
             self.last_error = result[:200]
             return
 
@@ -68,16 +74,26 @@ class TaskState:
             path = str(call.arguments.get("path", "unknown"))
             if path not in self.modified_files:
                 self.modified_files.append(path)
+            self.changes_pending_verification = True
+            self.full_tests_passed = False
             self.phase = "verify"
             self.last_error = "none"
         elif call.name == "run_command":
             if "Exit code: 0" in result:
                 self.latest_command = "passed (exit 0)"
-                self.phase = "finalize"
+                if self.changes_pending_verification and _is_full_test_command(call):
+                    self.changes_pending_verification = False
+                    self.full_tests_passed = True
+                if self.ready_to_finalize:
+                    self.phase = "finalize"
+                elif self.changes_pending_verification:
+                    self.phase = "verify"
+                else:
+                    self.phase = "inspect"
                 self.last_error = "none"
             else:
                 self.latest_command = "failed"
-                self.phase = "repair"
+                self.phase = "finalize" if self.ready_to_finalize else "repair"
                 self.last_error = result[:200]
 
     def message(self, remaining_rounds: int) -> dict[str, object]:
@@ -105,6 +121,26 @@ class TaskState:
                 "</task_state>"
             ),
         }
+
+
+def _is_full_test_command(call: ToolCall) -> bool:
+    if call.name != "run_command":
+        return False
+    argv = call.arguments.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return False
+
+    arguments = [str(value) for value in argv]
+    program = arguments[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if program in {"pytest", "pytest.exe", "py.test", "py.test.exe"}:
+        return True
+    if not program.startswith("python"):
+        return False
+    return (
+        len(arguments) >= 4
+        and arguments[1:3] == ["-m", "unittest"]
+        and "discover" in arguments[3:]
+    )
 
 
 class Agent:
@@ -202,47 +238,84 @@ class Agent:
                     }
                 )
 
-        final_step = self.max_steps + 1
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "The tool budget is exhausted. Do not call more tools. "
-                    "Give a concise, honest final report based on the results above."
-                ),
-            }
+            if state.ready_to_finalize:
+                return self._finalize(
+                    messages,
+                    state,
+                    step + 1,
+                    (
+                        "Full test suite passed after the latest file changes. "
+                        "Do not call more tools. Give a concise, honest final "
+                        "report in Chinese based on the completed work and tests."
+                    ),
+                    reason="verification_passed",
+                )
+
+        return self._finalize(
+            messages,
+            state,
+            self.max_steps + 1,
+            (
+                "The tool budget is exhausted. Do not call more tools. "
+                "Give a concise, honest final report based on the results above."
+            ),
+            reason="tool_budget_exhausted",
         )
-        request_messages = [*messages, state.message(0)]
-        self.trace.record("model_request", step=final_step, finalization=True)
+
+    def _finalize(
+        self,
+        messages: list[dict[str, object]],
+        state: TaskState,
+        step: int,
+        instruction: str,
+        *,
+        reason: str,
+    ) -> str:
+        request_messages = [
+            *messages,
+            state.message(0),
+            {"role": "system", "content": instruction},
+        ]
+        self.trace.record(
+            "model_request",
+            step=step,
+            finalization=True,
+            reason=reason,
+        )
         try:
             reply = self.model.complete(request_messages, [])
         except Exception as error:
             self.trace.record(
                 "task_error",
-                step=final_step,
+                step=step,
                 error_type=type(error).__name__,
             )
             raise AgentError(f"Final model request failed: {error}") from error
 
         self.trace.record(
             "model_reply",
-            step=final_step,
+            step=step,
             content=reply.content,
             tools=[call.name for call in reply.tool_calls],
         )
         if reply.tool_calls or not reply.content:
-            error = AgentError("Model did not provide a final answer after tool limit")
-            self.trace.record("task_error", step=final_step, error=str(error))
+            error = AgentError("Model did not provide a final answer")
+            self.trace.record("task_error", step=step, error=str(error))
             raise error
 
         if self._contains_tool_protocol(reply.content):
             return self._retry_final_answer(
                 request_messages,
                 reply.content,
-                final_step,
+                step,
+                fallback_answer=(
+                    self._verified_runtime_summary(state)
+                    if reason == "verification_passed"
+                    else None
+                ),
             )
 
-        self.trace.record("task_complete", step=final_step, answer=reply.content)
+        self.trace.record("task_complete", step=step, answer=reply.content)
         return reply.content
 
     @staticmethod
@@ -259,6 +332,7 @@ class Agent:
         messages: list[dict[str, object]],
         rejected_content: str,
         step: int,
+        fallback_answer: str | None = None,
     ) -> str:
         self.trace.record(
             "final_answer_rejected",
@@ -306,12 +380,34 @@ class Agent:
             or not reply.content
             or self._contains_tool_protocol(reply.content)
         ):
+            if fallback_answer is not None:
+                self.trace.record(
+                    "final_answer_fallback",
+                    step=step,
+                    reason="verified_model_answer_invalid",
+                )
+                self.trace.record(
+                    "task_complete",
+                    step=step,
+                    answer=fallback_answer,
+                )
+                return fallback_answer
             error = AgentError("Model did not provide a clean final answer")
             self.trace.record("task_error", step=step, error=str(error))
             raise error
 
         self.trace.record("task_complete", step=step, answer=reply.content)
         return reply.content
+
+    @staticmethod
+    def _verified_runtime_summary(state: TaskState) -> str:
+        files = "、".join(state.modified_files)
+        return (
+            "任务已完成。\n"
+            f"修改文件：{files}。\n"
+            "验证结果：修改后的完整测试已通过（退出码 0）。\n"
+            "模型最终总结包含无效工具协议，Runtime 已忽略该内容并根据验证记录生成本报告。"
+        )
 
     @staticmethod
     def _assistant_message(reply: ModelReply) -> dict[str, object]:

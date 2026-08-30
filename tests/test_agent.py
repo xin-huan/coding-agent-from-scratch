@@ -23,6 +23,37 @@ class FakeModel:
         return next(self.replies)
 
 
+def write_smoke_suite(root: Path, *, passing: bool = True) -> None:
+    tests = root / "project_tests"
+    tests.mkdir()
+    assertion = "self.assertTrue(True)" if passing else "self.fail('not fixed')"
+    (tests / "test_smoke.py").write_text(
+        "import unittest\n\n"
+        "class SmokeTests(unittest.TestCase):\n"
+        "    def test_smoke(self):\n"
+        f"        {assertion}\n",
+        encoding="utf-8",
+    )
+
+
+def full_test_call(call_id: str) -> ToolCall:
+    return ToolCall(
+        call_id,
+        "run_command",
+        {
+            "argv": [
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "project_tests",
+                "-v",
+            ]
+        },
+    )
+
+
 class AgentTests(unittest.TestCase):
     def test_allows_a_final_answer_after_the_last_tool_step(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -129,7 +160,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn("Modified files: result.txt", state_messages[0])
             self.assertIn("Remaining action rounds: 1", state_messages[0])
 
-    def test_task_state_tells_model_to_stop_after_passing_verification(self) -> None:
+    def test_plain_command_does_not_count_as_full_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "check.py").write_text("print('ok')\n", encoding="utf-8")
@@ -152,12 +183,136 @@ class AgentTests(unittest.TestCase):
             Agent(model, Workspace(root), max_steps=2).run("验证项目")
 
             state = str(model.received_messages[1][-1]["content"])
-            self.assertIn("Phase: finalize", state)
+            self.assertIn("Phase: inspect", state)
             self.assertIn("Latest command: passed (exit 0)", state)
-            self.assertIn(
-                "Return a final answer now. Do not call another tool",
-                state,
+            self.assertNotIn("Return a final answer now", state)
+
+    def test_finalizes_without_tools_after_changed_files_pass_full_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root)
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "write_file",
+                                {"path": "result.txt", "content": "done\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(full_test_call("call-2"),),
+                    ),
+                    ModelReply(content="修改完成，完整测试通过。"),
+                ]
             )
+
+            answer = Agent(model, Workspace(root)).run("修改并测试项目")
+
+            self.assertEqual(answer, "修改完成，完整测试通过。")
+            self.assertEqual(model.received_tools[2], [])
+            self.assertTrue(
+                any(
+                    "Full test suite passed" in str(message.get("content"))
+                    for message in model.received_messages[2]
+                )
+            )
+
+    def test_passing_tests_before_a_change_do_not_trigger_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root)
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(full_test_call("call-1"),),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-2",
+                                "write_file",
+                                {"path": "result.txt", "content": "changed\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="修改完成，尚未验证。"),
+                ]
+            )
+
+            Agent(model, Workspace(root)).run("先检查再修改")
+
+            self.assertNotEqual(model.received_tools[1], [])
+            self.assertNotEqual(model.received_tools[2], [])
+
+    def test_failed_full_tests_do_not_trigger_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root, passing=False)
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "write_file",
+                                {"path": "result.txt", "content": "changed\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(full_test_call("call-2"),),
+                    ),
+                    ModelReply(content="测试仍然失败。"),
+                ]
+            )
+
+            answer = Agent(model, Workspace(root)).run("修改并测试项目")
+
+            self.assertEqual(answer, "测试仍然失败。")
+            self.assertNotEqual(model.received_tools[2], [])
+
+    def test_uses_runtime_summary_when_verified_final_answer_stays_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_smoke_suite(root)
+            invalid_answer = ModelReply(
+                content="<｜DSML｜tool_calls><｜DSML｜invoke name=run_command>"
+            )
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "write_file",
+                                {"path": "result.txt", "content": "done\n"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(full_test_call("call-2"),),
+                    ),
+                    invalid_answer,
+                    invalid_answer,
+                ]
+            )
+
+            answer = Agent(model, Workspace(root)).run("修改并测试项目")
+
+            self.assertIn("完整测试已通过", answer)
+            self.assertIn("result.txt", answer)
+            self.assertNotIn("DSML", answer)
 
     def test_records_each_agent_step_in_trace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
