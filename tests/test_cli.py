@@ -10,6 +10,30 @@ from coding_agent.cli import main
 
 
 class CliTests(unittest.TestCase):
+    def test_user_can_resume_an_unfinished_workspace_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = io.StringIO()
+            environment = {
+                "DEEPSEEK_API_KEY": "test-secret",
+                "DEEPSEEK_MODEL": "test-model",
+            }
+
+            with patch.dict(os.environ, environment, clear=True):
+                with patch("coding_agent.cli.Path.cwd", return_value=Path(temp_dir)):
+                    with patch("coding_agent.cli.DeepSeekModel"):
+                        with patch(
+                            "coding_agent.cli.Agent.resume",
+                            return_value="已恢复未完成任务。",
+                        ):
+                            with patch("builtins.input", return_value="/exit"):
+                                with redirect_stdout(output):
+                                    exit_code = main(
+                                        ["--workspace", temp_dir, "--resume"]
+                                    )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("已恢复未完成任务。", output.getvalue())
+
     def test_user_can_start_and_exit_a_workspace_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output = io.StringIO()

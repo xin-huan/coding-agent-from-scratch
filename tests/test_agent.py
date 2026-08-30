@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from coding_agent.agent import Agent, ModelReply, ToolCall
+from coding_agent.checkpoint import CheckpointStore
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
 
@@ -21,6 +22,18 @@ class FakeModel:
         self.received_messages.append([message.copy() for message in messages])
         self.received_tools.append(tools)
         return next(self.replies)
+
+
+class InterruptingCheckpointStore(CheckpointStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.save_count = 0
+
+    def save(self, data: dict[str, object]) -> None:
+        super().save(data)
+        self.save_count += 1
+        if self.save_count == 1:
+            raise KeyboardInterrupt
 
 
 def write_smoke_suite(root: Path, *, passing: bool = True) -> None:
@@ -55,6 +68,138 @@ def full_test_call(call_id: str) -> ToolCall:
 
 
 class AgentTests(unittest.TestCase):
+    def test_resumes_after_the_last_completed_tool_without_repeating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint_path = root / "checkpoint.json"
+            interrupted_events: list[str] = []
+            first_model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "write_file",
+                                {"path": "first.txt", "content": "first\n"},
+                            ),
+                            ToolCall(
+                                "call-2",
+                                "write_file",
+                                {"path": "second.txt", "content": "second\n"},
+                            ),
+                        ),
+                    )
+                ]
+            )
+            interrupted_agent = Agent(
+                first_model,
+                Workspace(root),
+                checkpoint_store=InterruptingCheckpointStore(checkpoint_path),
+                on_event=interrupted_events.append,
+            )
+
+            with self.assertRaises(KeyboardInterrupt):
+                interrupted_agent.run("创建两个文件")
+
+            self.assertTrue((root / "first.txt").exists())
+            self.assertFalse((root / "second.txt").exists())
+
+            resumed_events: list[str] = []
+            resumed_agent = Agent(
+                FakeModel([ModelReply(content="两个文件均已创建。")]),
+                Workspace(root),
+                checkpoint_store=CheckpointStore(checkpoint_path),
+                on_event=resumed_events.append,
+            )
+            answer = resumed_agent.resume()
+
+            self.assertEqual(answer, "两个文件均已创建。")
+            self.assertEqual(interrupted_events, ["[工具] write_file"])
+            self.assertEqual(resumed_events, ["[工具] write_file"])
+            self.assertEqual((root / "first.txt").read_text(), "first\n")
+            self.assertEqual((root / "second.txt").read_text(), "second\n")
+            self.assertFalse(checkpoint_path.exists())
+    def test_ambiguous_task_pauses_for_clarification_without_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "ask_user",
+                                {"question": "你希望优化哪一方面？"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="已明确目标，准备处理性能问题。"),
+                ]
+            )
+            agent = Agent(model, Workspace(root))
+
+            question = agent.run("帮我优化这个项目")
+
+            self.assertEqual(question, "你希望优化哪一方面？")
+            self.assertTrue(agent.awaiting_clarification)
+            self.assertEqual(list(root.iterdir()), [])
+            gate_tools = {
+                str(definition["function"]["name"])
+                for definition in model.received_tools[0]
+            }
+            self.assertEqual(gate_tools, {"ask_user", "proceed_task"})
+
+            answer = agent.run("优化列表加载速度，保持现有接口不变")
+
+            self.assertEqual(answer, "已明确目标，准备处理性能问题。")
+            self.assertFalse(agent.awaiting_clarification)
+            continued_task = str(model.received_messages[1][1]["content"])
+            self.assertIn("帮我优化这个项目", continued_task)
+            self.assertIn("优化列表加载速度", continued_task)
+
+    def test_resumes_a_pending_clarification_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = CheckpointStore(root / "checkpoint.json")
+            first_agent = Agent(
+                FakeModel(
+                    [
+                        ModelReply(
+                            content=None,
+                            tool_calls=(
+                                ToolCall(
+                                    "call-1",
+                                    "ask_user",
+                                    {"question": "需要优化速度还是可读性？"},
+                                ),
+                            ),
+                        )
+                    ]
+                ),
+                Workspace(root),
+                checkpoint_store=store,
+            )
+            self.assertEqual(
+                first_agent.run("优化项目"),
+                "需要优化速度还是可读性？",
+            )
+
+            resumed_model = FakeModel([ModelReply(content="将优化运行速度。")])
+            resumed_agent = Agent(
+                resumed_model,
+                Workspace(root),
+                checkpoint_store=store,
+            )
+
+            self.assertEqual(resumed_agent.resume(), "需要优化速度还是可读性？")
+            self.assertTrue(resumed_agent.awaiting_clarification)
+            self.assertEqual(resumed_agent.run("运行速度"), "将优化运行速度。")
+            continued_task = str(resumed_model.received_messages[0][1]["content"])
+            self.assertIn("优化项目", continued_task)
+            self.assertIn("运行速度", continued_task)
+            self.assertFalse(store.path.exists())
     def test_allows_a_final_answer_after_the_last_tool_step(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model = FakeModel(
