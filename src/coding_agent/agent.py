@@ -9,6 +9,8 @@ from typing import Callable, Protocol
 
 from coding_agent.checkpoint import CheckpointError, CheckpointStore
 from coding_agent.context import ContextManager, ContextStats
+from coding_agent.project_memory import ProjectMemoryStore
+from coding_agent.skills import SkillRegistry
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.trace import NullTrace, Trace
 from coding_agent.workspace import Workspace
@@ -24,6 +26,10 @@ the complete relevant test suite after making changes. The final report must
 include the exact usage or launch instructions and the real test result.
 For a new Python project, prefer standard-library unittest unless the workspace
 already uses an available test runner. Do not install a package only to run tests.
+For desktop GUI or web UI tasks, include a launch/import smoke check and cover
+at least one real UI boundary or callback path when it can be tested without
+manual interaction. If a GUI cannot be opened in the environment, say that
+explicitly and verify the nearest automated seam instead.
 When an execution plan is supplied in task state, follow it before making
 changes, complete every planned deliverable before final verification, and use
 its acceptance checks to decide whether the task is complete.
@@ -155,6 +161,8 @@ logic and the user-interface or external-I/O boundary. Do not call local tools
 or provide a plain-text answer yet. For a new Python project, use the
 standard-library unittest runner unless the workspace already provides another
 test runner; never plan to install a test dependency.
+For desktop GUI or web UI projects, include a launch/import smoke check and a
+test or harness that exercises at least one UI callback or request path.
 """
 PLAN_REVIEW_PROMPT = """Review a proposed implementation plan against the
 original user request. Call approve_plan only if every explicit requirement is
@@ -313,7 +321,12 @@ class TaskState:
                 "files merely to confirm successful writes"
             ),
             "verify": "run focused verification for the changes",
-            "repair": "diagnose the latest failure before changing more code",
+            "repair": (
+                "diagnose the latest failure before changing more code: reproduce "
+                "the symptom, compare it with the user's report, test one focused "
+                "hypothesis, apply the smallest fix, then rerun the failing path "
+                "and relevant tests"
+            ),
             "review": "review every plan item and finish any missing deliverable",
             "finalize": (
                 "Return a final answer now. Do not call another tool unless an "
@@ -502,6 +515,8 @@ class Agent:
         trace: Trace | None = None,
         checkpoint_store: CheckpointStore | None = None,
         context_manager: ContextManager | None = None,
+        memory_store: ProjectMemoryStore | None = None,
+        skill_registry: SkillRegistry | None = None,
     ) -> None:
         self.model = model
         self.workspace = workspace
@@ -514,6 +529,8 @@ class Agent:
         self.on_event = on_event or (lambda _message: None)
         self.trace = trace or NullTrace()
         self.checkpoint_store = checkpoint_store
+        self.memory_store = memory_store
+        self.skill_registry = skill_registry or SkillRegistry.load_builtin()
         self._pending_task: str | None = None
         self._prompt_tokens = 0
         self._completion_tokens = 0
@@ -538,6 +555,10 @@ class Agent:
         messages: list[dict[str, object]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
         ]
+        project_memory = self._project_memory_message()
+        if project_memory is not None:
+            messages.append(project_memory)
+            self.trace.record("project_memory_attached")
         session_context = self._session_context_message()
         if session_context is not None:
             messages.append(session_context)
@@ -545,6 +566,12 @@ class Agent:
                 "session_context_attached",
                 completed_tasks=len(self._session_tasks),
             )
+        selected_skills = self.skill_registry.select(task)
+        if selected_skills:
+            skill_names = [skill.name for skill in selected_skills]
+            messages.extend(skill.message() for skill in selected_skills)
+            self.trace.record("skills_selected", skills=skill_names)
+            self.on_event(f"[技能] 已启用：{', '.join(skill_names)}")
         messages.append({"role": "user", "content": task})
         state = TaskState(task)
 
@@ -561,6 +588,11 @@ class Agent:
         answer = self._continue(task, messages, state, step=1)
         self._remember_completed_task(task, answer, state)
         return answer
+
+    def _project_memory_message(self) -> dict[str, object] | None:
+        if self.memory_store is None:
+            return None
+        return self.memory_store.build_message(self.workspace)
 
     def _session_context_message(self) -> dict[str, object] | None:
         if not self._session_tasks:
@@ -608,6 +640,15 @@ class Agent:
             completed_tasks=len(self._session_tasks),
             modified_files=state.modified_files,
         )
+        if self.memory_store is not None:
+            self.memory_store.update_after_task(
+                self.workspace,
+                task=task,
+                answer=answer,
+                modified_files=state.modified_files,
+                latest_command=state.latest_command,
+            )
+            self.trace.record("project_memory_updated")
 
     def _run_creation_planning_gate(
         self,
@@ -871,7 +912,7 @@ class Agent:
             raise AgentError(str(error)) from error
 
         self.trace.record("task_resumed", task=task, step=step)
-        return self._continue(
+        answer = self._continue(
             task,
             messages,
             state,
@@ -879,6 +920,8 @@ class Agent:
             pending_calls=pending_calls,
             next_call_index=next_call_index,
         )
+        self._remember_completed_task(task, answer, state)
+        return answer
 
     def _continue(
         self,

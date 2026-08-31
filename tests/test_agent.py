@@ -7,6 +7,7 @@ from pathlib import Path
 from coding_agent.agent import Agent, ModelReply, TaskState, TokenUsage, ToolCall
 from coding_agent.checkpoint import CheckpointStore
 from coding_agent.context import ContextManager
+from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
 
@@ -162,6 +163,69 @@ class AgentTests(unittest.TestCase):
             self.assertIn("当前项目是番茄钟应用", second_request)
             self.assertIn("inspect the current workspace files", second_request)
             self.assertFalse(any(event.startswith("[上下文]") for event in events))
+
+    def test_new_agent_instance_receives_persistent_project_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "project"
+            root.mkdir()
+            (root / "app.py").write_text("print('timer')\n", encoding="utf-8")
+            memory_store = ProjectMemoryStore(Path(temp_dir) / "memory")
+
+            Agent(
+                FakeModel([ModelReply(content="番茄钟项目已创建。\npython app.py")]),
+                Workspace(root),
+                memory_store=memory_store,
+            ).run("创建一个番茄钟应用")
+
+            second_model = FakeModel([ModelReply(content="这是番茄钟项目。")])
+            Agent(
+                second_model,
+                Workspace(root),
+                memory_store=memory_store,
+            ).run("为我介绍一下这个项目")
+
+            second_request = json.dumps(
+                second_model.received_messages[0],
+                ensure_ascii=False,
+            )
+            self.assertIn("<project_memory>", second_request)
+            self.assertIn("创建一个番茄钟应用", second_request)
+            self.assertIn("python app.py", second_request)
+            self.assertIn("app.py", second_request)
+
+    def test_bug_report_receives_diagnose_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace = JsonlTrace(Path(temp_dir) / "trace.jsonl")
+            events: list[str] = []
+            model = FakeModel([ModelReply(content="我会先复现再修复。")])
+
+            Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                trace=trace,
+                on_event=events.append,
+            ).run(
+                "运行时报错：Traceback NameError，请修复"
+            )
+
+            message_contents = [
+                str(message.get("content"))
+                for message in model.received_messages[0]
+            ]
+            trace_events = [
+                json.loads(line)
+                for line in trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            skill_event = next(
+                item for item in trace_events if item["event"] == "skills_selected"
+            )
+            request = "\n".join(message_contents)
+            self.assertIn('<skill name="diagnose">', request)
+            self.assertIn("Establish a fast feedback loop", request)
+            self.assertIn("regression test", request)
+            self.assertIn("re-run the original failing path", request.lower())
+            self.assertIn("diagnose", skill_event["data"]["skills"])
+            self.assertTrue(any(event.startswith("[技能]") for event in events))
 
     def test_from_scratch_project_is_planned_before_local_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -525,7 +589,11 @@ class AgentTests(unittest.TestCase):
 
             self.assertEqual(answer, "已明确目标，准备处理性能问题。")
             self.assertFalse(agent.awaiting_clarification)
-            continued_task = str(model.received_messages[1][1]["content"])
+            continued_task = next(
+                str(message.get("content"))
+                for message in model.received_messages[1]
+                if message.get("role") == "user"
+            )
             self.assertIn("帮我优化这个项目", continued_task)
             self.assertIn("优化列表加载速度", continued_task)
 
@@ -875,6 +943,11 @@ class AgentTests(unittest.TestCase):
 
             self.assertEqual(answer, "测试仍然失败。")
             self.assertNotEqual(model.received_tools[2], [])
+            repair_request = json.dumps(model.received_messages[2], ensure_ascii=False)
+            self.assertIn("Phase: repair", repair_request)
+            self.assertIn("reproduce the symptom", repair_request)
+            self.assertIn("test one focused hypothesis", repair_request)
+            self.assertIn("rerun the failing path", repair_request)
 
     def test_does_not_accept_unverified_code_changes_as_complete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

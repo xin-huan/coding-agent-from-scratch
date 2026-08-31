@@ -11,6 +11,7 @@ from coding_agent.agent import Agent, AgentError
 from coding_agent.checkpoint import CheckpointStore
 from coding_agent.config import ConfigError, Settings
 from coding_agent.model import DeepSeekModel, ModelError
+from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace, WorkspaceError
 
@@ -56,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path.cwd() / ".coding-agent" / "checkpoints",
             workspace.root,
         )
+        memory_store = ProjectMemoryStore(Path.cwd() / ".coding-agent" / "project-memory")
         print(f"[日志] {trace.path}")
         return Agent(
             DeepSeekModel(settings),
@@ -63,6 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             on_event=print,
             trace=trace,
             checkpoint_store=checkpoint,
+            memory_store=memory_store,
         )
 
     if args.resume:

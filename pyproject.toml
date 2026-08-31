@@ -11,6 +11,10 @@ dependencies = ["openai>=1.0"]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"
+coding-agent-chat = "coding_agent.chat:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"coding_agent.skills" = ["builtin/*.md"]
