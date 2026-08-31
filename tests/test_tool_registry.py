@@ -42,6 +42,42 @@ class ToolRegistryTests(unittest.TestCase):
                 self.assertIn("For example", description)
                 self.assertIn("Never use", description)
 
+    def test_command_description_names_allowed_programs_and_restrictions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            definitions = ToolRegistry(Workspace(Path(temp_dir))).definitions
+
+        command = next(
+            definition["function"]
+            for definition in definitions
+            if definition["function"]["name"] == "run_command"
+        )
+        description = command["description"]
+        self.assertIn("python", description)
+        self.assertIn("pytest", description)
+        self.assertIn("git", description)
+        self.assertIn("Do not use", description)
+        self.assertIn("python -c", description)
+
+    def test_reuses_unchanged_read_and_invalidates_after_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            registry = ToolRegistry(Workspace(root))
+
+            first = registry.execute("read_file", {"path": "module.py"})
+            second = registry.execute("read_file", {"path": "module.py"})
+            registry.execute(
+                "write_file",
+                {"path": "module.py", "content": "VALUE = 2\n"},
+            )
+            third = registry.execute("read_file", {"path": "module.py"})
+
+        self.assertIn("VALUE = 1", first)
+        self.assertIn("unchanged read cache hit", second)
+        self.assertNotIn("VALUE = 1", second)
+        self.assertIn("VALUE = 2", third)
+        self.assertEqual(registry.read_cache_hits, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

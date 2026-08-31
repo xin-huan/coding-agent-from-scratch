@@ -12,6 +12,10 @@ from coding_agent.config import Settings
 class ModelError(RuntimeError):
     """Raised when a model response cannot be used by the agent."""
 
+    def __init__(self, message: str, *, usage: TokenUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
 
 class DeepSeekModel:
     def __init__(self, settings: Settings, *, client: Any = None) -> None:
@@ -34,15 +38,22 @@ class DeepSeekModel:
             request["tools"] = tools
         response = self.client.chat.completions.create(**request)
         message = response.choices[0].message
+        usage = _response_usage(response)
 
         tool_calls: list[ToolCall] = []
         for call in message.tool_calls or []:
             try:
                 arguments = json.loads(call.function.arguments)
             except (TypeError, json.JSONDecodeError) as error:
-                raise ModelError(f"Invalid arguments for tool {call.function.name}") from error
+                raise ModelError(
+                    f"Invalid arguments for tool {call.function.name}",
+                    usage=usage,
+                ) from error
             if not isinstance(arguments, dict):
-                raise ModelError(f"Tool arguments must be an object: {call.function.name}")
+                raise ModelError(
+                    f"Tool arguments must be an object: {call.function.name}",
+                    usage=usage,
+                )
             tool_calls.append(
                 ToolCall(
                     id=call.id,
@@ -51,22 +62,22 @@ class DeepSeekModel:
                 )
             )
 
-        response_usage = getattr(response, "usage", None)
-        usage = None
-        if response_usage is not None:
-            usage = TokenUsage(
-                prompt_tokens=int(getattr(response_usage, "prompt_tokens", 0) or 0),
-                completion_tokens=int(
-                    getattr(response_usage, "completion_tokens", 0) or 0
-                ),
-                total_tokens=int(getattr(response_usage, "total_tokens", 0) or 0),
-                cache_hit_tokens=int(
-                    getattr(response_usage, "prompt_cache_hit_tokens", 0) or 0
-                ),
-            )
-
         return ModelReply(
             content=message.content,
             tool_calls=tuple(tool_calls),
             usage=usage,
         )
+
+
+def _response_usage(response: Any) -> TokenUsage | None:
+    response_usage = getattr(response, "usage", None)
+    if response_usage is None:
+        return None
+    return TokenUsage(
+        prompt_tokens=int(getattr(response_usage, "prompt_tokens", 0) or 0),
+        completion_tokens=int(getattr(response_usage, "completion_tokens", 0) or 0),
+        total_tokens=int(getattr(response_usage, "total_tokens", 0) or 0),
+        cache_hit_tokens=int(
+            getattr(response_usage, "prompt_cache_hit_tokens", 0) or 0
+        ),
+    )

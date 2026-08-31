@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
@@ -15,13 +16,17 @@ from coding_agent.workspace import Workspace
 
 SYSTEM_PROMPT = """You are a coding agent working in one local project workspace.
 Inspect relevant files before editing. Prefer apply_patch for existing files.
+Do not read a file back immediately after a successful write or patch unless
+the exact content is genuinely needed; rely on tool results and tests instead.
+Batch independent tool calls in one response when their contents are known.
 For implementation tasks, create or update necessary automated tests and run
 the complete relevant test suite after making changes. The final report must
 include the exact usage or launch instructions and the real test result.
 For a new Python project, prefer standard-library unittest unless the workspace
 already uses an available test runner. Do not install a package only to run tests.
 When an execution plan is supplied in task state, follow it before making
-changes and use its acceptance checks to decide whether the task is complete.
+changes, complete every planned deliverable before final verification, and use
+its acceptance checks to decide whether the task is complete.
 For read-only tasks, do not modify files merely to add tests. If meaningful
 automated testing is not possible, explain the validation performed instead.
 Never access secrets or paths outside the workspace.
@@ -147,7 +152,9 @@ observable acceptance checks, and an automated test strategy. Include the
 launchable entry point and usage documentation in the plan. For a nontrivial
 application, keep the launch entry point thin and separate from testable core
 logic and the user-interface or external-I/O boundary. Do not call local tools
-or provide a plain-text answer yet.
+or provide a plain-text answer yet. For a new Python project, use the
+standard-library unittest runner unless the workspace already provides another
+test runner; never plan to install a test dependency.
 """
 PLAN_REVIEW_PROMPT = """Review a proposed implementation plan against the
 original user request. Call approve_plan only if every explicit requirement is
@@ -196,6 +203,7 @@ class AgentError(RuntimeError):
 class TaskState:
     goal: str
     phase: str = "inspect"
+    creation_task: bool = False
     modified_files: list[str] = field(default_factory=list)
     latest_command: str = "not run"
     last_error: str = "none"
@@ -208,7 +216,32 @@ class TaskState:
 
     @property
     def ready_to_finalize(self) -> bool:
-        return self.full_tests_passed and not self.changes_pending_verification
+        return (
+            self.full_tests_passed
+            and not self.changes_pending_verification
+            and not self.missing_deliverables
+        )
+
+    @property
+    def missing_deliverables(self) -> list[str]:
+        if not self.creation_task:
+            return []
+        paths = [path.replace("\\", "/").casefold() for path in self.modified_files]
+        missing: list[str] = []
+        implementation = [
+            path
+            for path in paths
+            if path.endswith(".py") and not _is_test_path(path)
+        ]
+        if not implementation:
+            missing.append("implementation source")
+        if not any(_is_entry_point(path) for path in implementation):
+            missing.append("entry point")
+        if not any(_is_test_path(path) for path in paths):
+            missing.append("automated tests")
+        if not any(path.rsplit("/", 1)[-1].startswith("readme") for path in paths):
+            missing.append("usage documentation")
+        return missing
 
     def update(self, call: ToolCall, result: str, success: bool) -> None:
         if not success:
@@ -224,17 +257,27 @@ class TaskState:
             if str(path).lower().endswith(".py"):
                 self.implementation_changes_pending = True
             self.full_tests_passed = False
-            self.phase = "verify"
+            self.phase = "implement" if self.missing_deliverables else "verify"
             self.last_error = "none"
         elif call.name == "run_command":
             if "Exit code: 0" in result:
                 self.latest_command = "passed (exit 0)"
                 if self.changes_pending_verification and _is_full_test_command(call):
-                    self.changes_pending_verification = False
-                    self.implementation_changes_pending = False
-                    self.full_tests_passed = True
+                    if _test_command_ran_tests(call, result):
+                        self.changes_pending_verification = False
+                        self.implementation_changes_pending = False
+                        self.full_tests_passed = True
+                    else:
+                        self.latest_command = "not verified (no tests executed)"
+                        self.phase = "verify"
+                        self.last_error = (
+                            "Test command exited 0 but no tests were executed"
+                        )
+                        return
                 if self.ready_to_finalize:
                     self.phase = "review" if self.plan else "finalize"
+                elif self.missing_deliverables:
+                    self.phase = "implement"
                 elif self.changes_pending_verification:
                     self.phase = "verify"
                 else:
@@ -245,12 +288,30 @@ class TaskState:
                 self.phase = "finalize" if self.ready_to_finalize else "repair"
                 self.last_error = result[:200]
 
-    def message(self, remaining_rounds: int) -> dict[str, object]:
-        files = ", ".join(self.modified_files) or "none"
+    def contract_message(self) -> dict[str, object]:
         plan = " | ".join(self.plan) or "none"
         acceptance = " | ".join(self.acceptance) or "none"
+        return {
+            "role": "system",
+            "content": (
+                "<task_contract>\n"
+                f"Goal: {self.goal}\n"
+                f"Execution plan: {plan}\n"
+                f"Acceptance checks: {acceptance}\n"
+                f"Test strategy: {self.test_strategy}\n"
+                "</task_contract>"
+            ),
+        }
+
+    def message(self, remaining_rounds: int) -> dict[str, object]:
+        files = ", ".join(self.modified_files) or "none"
+        missing = ", ".join(self.missing_deliverables) or "none"
         next_focus = {
             "inspect": "inspect only the files needed for the task",
+            "implement": (
+                "create the missing deliverables before verification; do not reread "
+                "files merely to confirm successful writes"
+            ),
             "verify": "run focused verification for the changes",
             "repair": "diagnose the latest failure before changing more code",
             "review": "review every plan item and finish any missing deliverable",
@@ -263,14 +324,11 @@ class TaskState:
             "role": "system",
             "content": (
                 "<task_state>\n"
-                f"Goal: {self.goal}\n"
                 f"Phase: {self.phase}\n"
                 f"Modified files: {files}\n"
+                f"Missing deliverables: {missing}\n"
                 f"Latest command: {self.latest_command}\n"
                 f"Last error: {self.last_error}\n"
-                f"Execution plan: {plan}\n"
-                f"Acceptance checks: {acceptance}\n"
-                f"Test strategy: {self.test_strategy}\n"
                 f"Remaining action rounds: {remaining_rounds}\n"
                 f"Next focus: {next_focus}\n"
                 "</task_state>"
@@ -281,6 +339,7 @@ class TaskState:
         return {
             "goal": self.goal,
             "phase": self.phase,
+            "creation_task": self.creation_task,
             "modified_files": self.modified_files,
             "latest_command": self.latest_command,
             "last_error": self.last_error,
@@ -312,6 +371,7 @@ class TaskState:
         return cls(
             goal=str(data.get("goal", "")),
             phase=str(data.get("phase", "inspect")),
+            creation_task=bool(data.get("creation_task", False)),
             modified_files=modified_files,
             latest_command=str(data.get("latest_command", "not run")),
             last_error=str(data.get("last_error", "none")),
@@ -328,6 +388,30 @@ class TaskState:
         )
 
 
+@dataclass(frozen=True)
+class SessionTaskSummary:
+    task: str
+    answer: str
+    modified_files: tuple[str, ...]
+    latest_command: str
+
+
+def _is_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").casefold()
+    name = normalized.rsplit("/", 1)[-1]
+    return (
+        normalized.startswith("tests/")
+        or "/tests/" in normalized
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+    )
+
+
+def _is_entry_point(path: str) -> bool:
+    name = path.replace("\\", "/").casefold().rsplit("/", 1)[-1]
+    return name in {"main.py", "__main__.py", "app.py"}
+
+
 def _is_full_test_command(call: ToolCall) -> bool:
     if call.name != "run_command":
         return False
@@ -342,6 +426,18 @@ def _is_full_test_command(call: ToolCall) -> bool:
     if not program.startswith("python"):
         return False
     return len(arguments) >= 3 and arguments[1:3] == ["-m", "unittest"]
+
+
+def _test_command_ran_tests(call: ToolCall, result: str) -> bool:
+    argv = call.arguments.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return False
+    program = str(argv[0]).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if program in {"pytest", "pytest.exe", "py.test", "py.test.exe"}:
+        match = re.search(r"\b(\d+)\s+passed\b", result)
+    else:
+        match = re.search(r"\bRan\s+(\d+)\s+tests?\b", result)
+    return match is not None and int(match.group(1)) > 0
 
 
 def _needs_clarification_gate(task: str) -> bool:
@@ -388,6 +484,13 @@ def _needs_creation_plan(task: str) -> bool:
     )
 
 
+def _compact_text(text: str, limit: int) -> str:
+    compacted = " ".join(text.split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 3].rstrip() + "..."
+
+
 class Agent:
     def __init__(
         self,
@@ -402,16 +505,20 @@ class Agent:
     ) -> None:
         self.model = model
         self.workspace = workspace
-        self.tools = ToolRegistry(workspace)
+        self.context_manager = context_manager or ContextManager(enabled=False)
+        self.tools = ToolRegistry(
+            workspace,
+            cache_reads=self.context_manager.enabled,
+        )
         self.max_steps = max_steps
         self.on_event = on_event or (lambda _message: None)
         self.trace = trace or NullTrace()
         self.checkpoint_store = checkpoint_store
-        self.context_manager = context_manager or ContextManager()
         self._pending_task: str | None = None
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._cache_hit_tokens = 0
+        self._session_tasks: list[SessionTaskSummary] = []
 
     @property
     def awaiting_clarification(self) -> bool:
@@ -424,12 +531,21 @@ class Agent:
                 f"User clarification:\n{task}"
             )
             self._pending_task = None
+        self.context_manager.start_task(reset=not self._session_tasks)
+        self.tools.start_task()
         self.on_event("[状态] 正在分析任务")
         self.trace.record("task_start", task=task)
         messages: list[dict[str, object]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task},
         ]
+        session_context = self._session_context_message()
+        if session_context is not None:
+            messages.append(session_context)
+            self.trace.record(
+                "session_context_attached",
+                completed_tasks=len(self._session_tasks),
+            )
+        messages.append({"role": "user", "content": task})
         state = TaskState(task)
 
         if _needs_clarification_gate(task):
@@ -442,7 +558,56 @@ class Agent:
             if question is not None:
                 return question
 
-        return self._continue(task, messages, state, step=1)
+        answer = self._continue(task, messages, state, step=1)
+        self._remember_completed_task(task, answer, state)
+        return answer
+
+    def _session_context_message(self) -> dict[str, object] | None:
+        if not self._session_tasks:
+            return None
+        recent = self._session_tasks[-5:]
+        lines = [
+            "<session_context>",
+            "The user is continuing in the same CLI session and workspace. "
+            "Treat the new request as a follow-up to the current project unless "
+            "the user clearly asks to switch projects.",
+            "Use this as orientation only: inspect the current workspace files "
+            "before editing or explaining behavior.",
+            "Recent completed tasks:",
+        ]
+        for index, summary in enumerate(recent, start=1):
+            files = ", ".join(summary.modified_files) or "none"
+            lines.extend(
+                [
+                    f"{index}. Task: {_compact_text(summary.task, 240)}",
+                    f"   Result: {_compact_text(summary.answer, 320)}",
+                    f"   Modified files: {files}",
+                    f"   Latest command: {summary.latest_command}",
+                ]
+            )
+        lines.append("</session_context>")
+        return {"role": "system", "content": "\n".join(lines)}
+
+    def _remember_completed_task(
+        self,
+        task: str,
+        answer: str,
+        state: TaskState,
+    ) -> None:
+        self._session_tasks.append(
+            SessionTaskSummary(
+                task=task,
+                answer=answer,
+                modified_files=tuple(state.modified_files),
+                latest_command=state.latest_command,
+            )
+        )
+        del self._session_tasks[:-5]
+        self.trace.record(
+            "session_context_updated",
+            completed_tasks=len(self._session_tasks),
+            modified_files=state.modified_files,
+        )
 
     def _run_creation_planning_gate(
         self,
@@ -496,6 +661,7 @@ class Agent:
         state.plan = steps
         state.acceptance = acceptance
         state.test_strategy = test_strategy
+        state.creation_task = True
         self.on_event(f"[计划] {' → '.join(steps)}")
         self.trace.record(
             "task_planned",
@@ -630,6 +796,7 @@ class Agent:
                 [ASK_USER_DEFINITION, PROCEED_TASK_DEFINITION],
             )
         except Exception as error:
+            self._observe_error_usage(error, step=0)
             self.trace.record(
                 "task_error",
                 step=0,
@@ -740,15 +907,27 @@ class Agent:
             if step > 1:
                 self.on_event("[状态] 正在规划下一步")
             self.trace.record("model_request", step=step)
+            action_tools = self._action_tools(state)
             request_messages = self._build_request_context(
                 messages,
                 [state.message(self.max_steps - step + 1)],
                 step=step,
+                contract_messages=[state.contract_message()],
+                tools=action_tools,
             )
-            reply = self._complete_action_request(request_messages, step)
+            reply = self._complete_action_request(
+                request_messages,
+                step,
+                action_tools,
+            )
 
             self.trace.record(
                 "model_reply",
+                step=step,
+                content=reply.content,
+                tools=[call.name for call in reply.tool_calls],
+            )
+            self.context_manager.record_step(
                 step=step,
                 content=reply.content,
                 tools=[call.name for call in reply.tool_calls],
@@ -770,6 +949,29 @@ class Agent:
                 return self._pause_for_clarification(task, question, step=step)
             if not reply.tool_calls:
                 if reply.content:
+                    if state.missing_deliverables:
+                        self.trace.record(
+                            "completion_deferred",
+                            step=step,
+                            reason="missing_deliverables",
+                            missing=state.missing_deliverables,
+                        )
+                        messages.extend(
+                            [
+                                {"role": "assistant", "content": reply.content},
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "The task is not complete. Create these missing "
+                                        "deliverables before answering: "
+                                        + ", ".join(state.missing_deliverables)
+                                        + "."
+                                    ),
+                                },
+                            ]
+                        )
+                        step += 1
+                        continue
                     if state.implementation_changes_pending:
                         self.trace.record(
                             "completion_deferred",
@@ -834,13 +1036,25 @@ class Agent:
         self,
         request_messages: list[dict[str, object]],
         step: int,
+        tools: list[dict[str, object]],
     ) -> ModelReply:
         return self._complete_model_request(
             request_messages,
-            [*self.tools.definitions, ASK_USER_DEFINITION],
+            tools,
             step=step,
             error_prefix="Model request",
         )
+
+    def _action_tools(self, state: TaskState) -> list[dict[str, object]]:
+        definitions = self.tools.definitions
+        if state.phase == "verify" and state.changes_pending_verification:
+            allowed = {"write_file", "apply_patch", "run_command"}
+            definitions = [
+                definition
+                for definition in definitions
+                if definition.get("function", {}).get("name") in allowed
+            ]
+        return [*definitions, ASK_USER_DEFINITION]
 
     def _build_request_context(
         self,
@@ -848,8 +1062,15 @@ class Agent:
         tail_messages: list[dict[str, object]],
         *,
         step: int,
+        contract_messages: list[dict[str, object]] | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> list[dict[str, object]]:
-        request = self.context_manager.build(messages, tail_messages)
+        request = self.context_manager.build(
+            messages,
+            contract_messages=contract_messages,
+            state_messages=tail_messages,
+            tools=tools,
+        )
         stats: ContextStats = self.context_manager.last_stats
         self.trace.record(
             "context_built",
@@ -857,15 +1078,21 @@ class Agent:
             original_characters=stats.original_characters,
             sent_characters=stats.sent_characters,
             saved_characters=stats.saved_characters,
+            original_tokens=stats.original_tokens,
+            sent_tokens=stats.sent_tokens,
+            saved_tokens=stats.saved_tokens,
+            tool_definition_tokens=stats.tool_definition_tokens,
             summarized_messages=stats.summarized_messages,
+            retrieved_entries=stats.retrieved_entries,
+            context_mode=self.context_manager.mode,
         )
         if stats.summarized_messages:
             percent = round(
-                stats.saved_characters * 100 / max(1, stats.original_characters)
+                stats.saved_tokens * 100 / max(1, stats.original_tokens)
             )
             self.on_event(
                 f"[上下文] 已压缩 {stats.summarized_messages} 条旧消息，"
-                f"本轮字符量减少约 {percent}%"
+                f"本轮预计 Token 减少约 {percent}%"
             )
         return request
 
@@ -876,6 +1103,7 @@ class Agent:
         self._prompt_tokens += usage.prompt_tokens
         self._completion_tokens += usage.completion_tokens
         self._cache_hit_tokens += usage.cache_hit_tokens
+        self.context_manager.observe_prompt_usage(usage.prompt_tokens)
         total = self._prompt_tokens + self._completion_tokens
         self.on_event(
             f"[Token] 本次输入 {usage.prompt_tokens}，输出 {usage.completion_tokens}；"
@@ -893,6 +1121,11 @@ class Agent:
             cumulative_cache_hit_tokens=self._cache_hit_tokens,
         )
 
+    def _observe_error_usage(self, error: Exception, *, step: int) -> None:
+        usage = getattr(error, "usage", None)
+        if isinstance(usage, TokenUsage):
+            self._observe_usage(ModelReply(content=None, usage=usage), step=step)
+
     def _complete_model_request(
         self,
         request_messages: list[dict[str, object]],
@@ -908,6 +1141,7 @@ class Agent:
                 self._observe_usage(reply, step=step)
                 return reply
             except Exception as error:
+                self._observe_error_usage(error, step=step)
                 if attempt == 0:
                     self.on_event("[状态] 模型响应异常，正在重试")
                     self.trace.record(
@@ -977,6 +1211,15 @@ class Agent:
                 else:
                     self.on_event("[状态] 测试失败，正在分析原因")
             state.update(call, result, success)
+            self.context_manager.record_tool(
+                step=step,
+                name=call.name,
+                arguments=call.arguments,
+                result=result,
+                success=success,
+                version=str(self.tools.last_metadata.get("version", "")),
+                file_content=str(self.tools.last_metadata.get("content", "")),
+            )
             self.trace.record(
                 "tool_result",
                 step=step,
@@ -984,11 +1227,25 @@ class Agent:
                 success=success,
                 result=result,
             )
+            if call.name == "read_file" and result.startswith(
+                "unchanged read cache hit:"
+            ):
+                self.trace.record(
+                    "read_cache_hit",
+                    step=step,
+                    path=call.arguments.get("path", ""),
+                )
+            distilled_result = self.context_manager.distill_tool_result(
+                call.name,
+                call.arguments,
+                result,
+                success=success,
+            )
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": result,
+                    "content": distilled_result,
                 }
             )
             self._save_checkpoint(
@@ -1097,6 +1354,8 @@ class Agent:
                 {"role": "system", "content": instruction},
             ],
             step=step,
+            contract_messages=[state.contract_message()],
+            tools=[],
         )
         self.trace.record(
             "model_request",
@@ -1107,6 +1366,7 @@ class Agent:
         try:
             reply = self.model.complete(request_messages, [])
         except Exception as error:
+            self._observe_error_usage(error, step=step)
             self.trace.record(
                 "task_error",
                 step=step,
@@ -1185,6 +1445,7 @@ class Agent:
         try:
             reply = self.model.complete(retry_messages, [])
         except Exception as error:
+            self._observe_error_usage(error, step=step)
             self.trace.record(
                 "task_error",
                 step=step,

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from coding_agent.config import Settings
-from coding_agent.model import DeepSeekModel
+from coding_agent.model import DeepSeekModel, ModelError
 
 
 class FakeCompletions:
@@ -26,6 +26,13 @@ class FakeCompletions:
             choices=[SimpleNamespace(message=message)],
             usage=usage,
         )
+
+
+class InvalidCompletions(FakeCompletions):
+    def create(self, **request: object) -> object:
+        response = super().create(**request)
+        response.choices[0].message.tool_calls[0].function.arguments = "{invalid"
+        return response
 
 
 class DeepSeekModelTests(unittest.TestCase):
@@ -53,6 +60,17 @@ class DeepSeekModelTests(unittest.TestCase):
         model.complete([], [])
 
         self.assertNotIn("tools", completions.request)
+
+    def test_invalid_tool_arguments_keep_billable_usage(self) -> None:
+        completions = InvalidCompletions()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        model = DeepSeekModel(Settings(api_key="test-secret"), client=client)
+
+        with self.assertRaises(ModelError) as raised:
+            model.complete([], [{"type": "function"}])
+
+        self.assertEqual(raised.exception.usage.prompt_tokens, 120)
+        self.assertEqual(raised.exception.usage.completion_tokens, 30)
 
 
 if __name__ == "__main__":

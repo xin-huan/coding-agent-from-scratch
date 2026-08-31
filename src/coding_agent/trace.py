@@ -10,6 +10,19 @@ from uuid import uuid4
 
 
 SENSITIVE_MARKERS = ("key", "token", "secret", "password", "authorization")
+SAFE_METRIC_FIELDS = {
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cache_hit_tokens",
+    "cumulative_prompt_tokens",
+    "cumulative_completion_tokens",
+    "cumulative_cache_hit_tokens",
+    "original_tokens",
+    "sent_tokens",
+    "saved_tokens",
+    "tool_definition_tokens",
+}
 
 
 class Trace(Protocol):
@@ -42,7 +55,10 @@ class JsonlTrace:
 
 
 def _sanitize(value: Any, field_name: str = "") -> Any:
-    if any(marker in field_name.lower() for marker in SENSITIVE_MARKERS):
+    normalized_field = field_name.lower()
+    if normalized_field not in SAFE_METRIC_FIELDS and any(
+        marker in normalized_field for marker in SENSITIVE_MARKERS
+    ):
         return "[REDACTED]"
     if isinstance(value, dict):
         return {key: _sanitize(item, str(key)) for key, item in value.items()}
