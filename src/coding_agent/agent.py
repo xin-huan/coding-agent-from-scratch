@@ -15,6 +15,7 @@ from coding_agent.extensions import (
     ExtensionManager,
     ProjectMemoryExtension,
     SkillSelectionExtension,
+    SubAgentExtension,
     ToolResult,
 )
 from coding_agent.project_memory import ProjectMemoryStore
@@ -358,6 +359,9 @@ class TaskState:
                 f"Last error: {self.last_error}\n"
                 f"Remaining action rounds: {remaining_rounds}\n"
                 f"Next focus: {next_focus}\n"
+                "Task list:\n"
+                + "\n".join(self.task_list_lines())
+                + "\n"
                 "</task_state>"
             ),
         }
@@ -418,6 +422,43 @@ class TaskState:
             test_strategy=str(data.get("test_strategy", "not planned")),
         )
 
+    def task_list_lines(self) -> list[str]:
+        tasks = self.plan or _default_task_list(self.phase)
+        return [
+            f"- [{self._task_status(task, index)}] {task}"
+            for index, task in enumerate(tasks)
+        ]
+
+    def _task_status(self, task: str, index: int) -> str:
+        if not self.plan:
+            return _default_task_status(
+                self.phase,
+                index,
+                changed=bool(self.modified_files),
+                verified=self.full_tests_passed,
+                ready=self.ready_to_finalize,
+            )
+        normalized = task.casefold()
+        if self.ready_to_finalize:
+            return "done"
+        if _task_mentions_usage(normalized):
+            return "done" if self.usage_documentation_seen or not self.missing_deliverables else "pending"
+        if _task_mentions_tests(normalized):
+            if self.full_tests_passed:
+                return "done"
+            return "current" if self.phase in {"verify", "repair"} else "pending"
+        if _task_mentions_entry(normalized):
+            return "done" if "entry point" not in self.missing_deliverables else "pending"
+        if _task_mentions_implementation(normalized):
+            if "implementation source" not in self.missing_deliverables:
+                return "done" if self.phase in {"verify", "review", "finalize"} else "current"
+            return "current" if self.phase in {"inspect", "implement"} and index == 0 else "pending"
+        if index == 0 and self.phase in {"inspect", "implement"}:
+            return "current"
+        if self.phase in {"verify", "repair", "review", "finalize"} and index < len(self.plan):
+            return "done"
+        return "pending"
+
 
 @dataclass(frozen=True)
 class SessionTaskSummary:
@@ -474,6 +515,76 @@ def _contains_usage_documentation(content: str) -> bool:
         )
     )
     return launch_command is not None and usage_word
+
+
+def _default_task_list(phase: str) -> list[str]:
+    if phase == "repair":
+        return ["复现和定位失败", "实施最小修复", "重新运行相关验证", "整理交付结果"]
+    return ["检查相关文件", "完成必要修改", "运行相关验证", "整理交付结果"]
+
+
+def _default_task_status(
+    phase: str,
+    index: int,
+    *,
+    changed: bool,
+    verified: bool,
+    ready: bool,
+) -> str:
+    if ready:
+        return "done"
+    if phase == "inspect":
+        return "current" if index == 0 else "pending"
+    if phase == "implement":
+        if index == 0:
+            return "done"
+        return "current" if index == 1 else "pending"
+    if phase == "repair":
+        return "current" if index == 0 else "pending"
+    if phase == "verify":
+        if index == 0 or (index == 1 and changed):
+            return "done"
+        return "current" if index == 2 else "pending"
+    if phase in {"review", "finalize"}:
+        if index <= 2 and (changed or verified):
+            return "done"
+        return "current" if index == 3 else "pending"
+    return "pending"
+
+
+def _task_mentions_usage(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in ("readme", "usage", "使用说明", "启动说明", "文档")
+    )
+
+
+def _task_mentions_tests(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in ("test", "unittest", "pytest", "测试", "验证", "compile")
+    )
+
+
+def _task_mentions_entry(normalized: str) -> bool:
+    return any(marker in normalized for marker in ("entry", "launch", "入口", "启动"))
+
+
+def _task_mentions_implementation(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in (
+            "实现",
+            "创建",
+            "编写",
+            "修改",
+            "core",
+            "ui",
+            "gui",
+            "module",
+            "app",
+        )
+    )
 
 
 def _is_full_test_command(call: ToolCall) -> bool:
@@ -583,6 +694,7 @@ class Agent:
         configured_extensions.append(
             SkillSelectionExtension(skill_registry or SkillRegistry.load_builtin())
         )
+        configured_extensions.append(SubAgentExtension(model))
         configured_extensions.extend(extensions)
         configured_extensions.append(context_pack or ContextPackExtension())
         self.extensions = ExtensionManager(configured_extensions)
@@ -644,6 +756,8 @@ class Agent:
             question = self._run_creation_planning_gate(task, state)
             if question is not None:
                 return question
+        else:
+            self._emit_task_list(state)
 
         answer: str | None = None
         error: Exception | None = None
@@ -764,6 +878,7 @@ class Agent:
         state.test_strategy = test_strategy
         state.creation_task = True
         self.on_event(f"[计划] {' → '.join(steps)}")
+        self._emit_task_list(state)
         self.trace.record(
             "task_planned",
             step=0,
@@ -917,6 +1032,12 @@ class Agent:
             self.trace.record("clarification_passed", step=0)
             return None
         raise AgentError("Model did not make a valid clarification decision")
+
+    def _emit_task_list(self, state: TaskState) -> None:
+        lines = state.task_list_lines()
+        for index, line in enumerate(lines, start=1):
+            self.on_event(f"[任务] {index}. {line}")
+        self.trace.record("task_list_updated", tasks=lines)
 
     def resume(self) -> str:
         self.on_event("[状态] 正在恢复任务")
@@ -1231,6 +1352,13 @@ class Agent:
             try:
                 reply = self.model.complete(retry_messages, tools)
                 self._observe_usage(reply, step=step)
+                invalid_tools = self._unavailable_tool_calls(reply, tools)
+                if invalid_tools:
+                    available = ", ".join(sorted(self._available_tool_names(tools))) or "none"
+                    raise ValueError(
+                        "Model called unavailable tool(s): "
+                        f"{', '.join(invalid_tools)}. Available tools: {available}"
+                    )
                 if self._extension_context is not None:
                     self.extensions.after_llm_call(
                         self._extension_context,
@@ -1612,6 +1740,26 @@ class Agent:
             "验证结果：修改后的完整测试已通过（退出码 0）。\n"
             "模型最终总结包含无效工具协议，Runtime 已忽略该内容并根据验证记录生成本报告。"
         )
+
+    @staticmethod
+    def _available_tool_names(tools: list[dict[str, object]]) -> set[str]:
+        names: set[str] = set()
+        for tool in tools:
+            function = tool.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+                if isinstance(name, str):
+                    names.add(name)
+        return names
+
+    @classmethod
+    def _unavailable_tool_calls(
+        cls,
+        reply: ModelReply,
+        tools: list[dict[str, object]],
+    ) -> list[str]:
+        available = cls._available_tool_names(tools)
+        return sorted({call.name for call in reply.tool_calls if call.name not in available})
 
     @staticmethod
     def _tool_call_to_data(call: ToolCall) -> dict[str, object]:

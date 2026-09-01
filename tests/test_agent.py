@@ -110,6 +110,271 @@ class EchoToolExtension(BaseExtension):
         return ToolResult(f"extension echo: {call.arguments['text']}")
 
 
+class SubAgentOuterModel(FakeModel):
+    def complete(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> ModelReply:
+        self.received_messages.append([message.copy() for message in messages])
+        self.received_tools.append(tools)
+        if len(self.received_messages) == 1:
+            return ModelReply(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        "delegate-1",
+                        "delegate_subagent",
+                        {
+                            "role": "reviewer",
+                            "question": "后端启动失败的最可能原因是什么？",
+                            "focus": "backend failure",
+                            "paths": ["backend"],
+                            "search_terms": ["Traceback", "TODO"],
+                        },
+                    ),
+                ),
+            )
+        if len(self.received_messages) == 2:
+            return ModelReply(
+                content=(
+                    "Summary: backend/app.py imports missing_config.\n"
+                    "Evidence: backend/app.py line 1.\n"
+                    "Risks: frontend and database not inspected.\n"
+                    "Suggested next checks: inspect backend configuration."
+                )
+            )
+        return ModelReply(content="主要问题在后端配置导入。")
+
+
+class ReviewerGateModel:
+    def __init__(self) -> None:
+        self.main_calls = 0
+        self.main_tool_names: list[set[str]] = []
+        self.main_requests: list[str] = []
+        self.subagent_requests: list[str] = []
+
+    def complete(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> ModelReply:
+        tool_names = {tool["function"]["name"] for tool in tools}
+        request = json.dumps(messages, ensure_ascii=False)
+        if "You are a read-only subagent" in request:
+            self.subagent_requests.append(request)
+            self.assert_subagent_tools(tool_names)
+            return ModelReply(
+                content=json.dumps(
+                    {
+                        "taskId": "delegate-review",
+                        "summary": "Changed backend/auth.py is small and tests should cover it.",
+                        "findings": [],
+                        "artifacts": ["backend/auth.py"],
+                        "confidence": 0.82,
+                        "risks": ["Only smoke tests are available."],
+                        "recommendedNextStep": "Run the project smoke tests.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        self.main_calls += 1
+        self.main_tool_names.append(tool_names)
+        self.main_requests.append(request)
+        if self.main_calls == 1:
+            return ModelReply(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        "write-1",
+                        "write_file",
+                        {"path": "backend/auth.py", "content": "FIXED = True\n"},
+                    ),
+                ),
+            )
+        if self.main_calls == 2:
+            if "run_command" not in tool_names:
+                raise AssertionError("run_command should remain visible for stable retries")
+            return ModelReply(content=None, tool_calls=(full_test_call("premature-test"),))
+        if self.main_calls == 3:
+            if "run_command" not in tool_names:
+                raise AssertionError("run_command should remain available after reviewer completes")
+            return ModelReply(content=None, tool_calls=(full_test_call("test-1"),))
+        return ModelReply(content="已修复并通过测试。")
+
+    @staticmethod
+    def assert_subagent_tools(tool_names: set[str]) -> None:
+        expected = {"list_files", "read_file", "search_text", "run_command"}
+        if tool_names != expected:
+            raise AssertionError(f"Unexpected subagent tools: {tool_names}")
+
+
+class ExplicitReviewerModel(ReviewerGateModel):
+    def complete(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> ModelReply:
+        tool_names = {tool["function"]["name"] for tool in tools}
+        request = json.dumps(messages, ensure_ascii=False)
+        if "You are a read-only subagent" in request:
+            self.subagent_requests.append(request)
+            self.assert_subagent_tools(tool_names)
+            return ModelReply(
+                content=json.dumps(
+                    {
+                        "taskId": "delegate-review",
+                        "summary": "No blocking issues found.",
+                        "findings": [],
+                        "artifacts": ["backend/auth.py"],
+                        "confidence": 0.82,
+                        "risks": [],
+                        "recommendedNextStep": "Run the smoke tests.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        self.main_calls += 1
+        self.main_tool_names.append(tool_names)
+        self.main_requests.append(request)
+        if self.main_calls == 1:
+            return ModelReply(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        "write-1",
+                        "write_file",
+                        {"path": "backend/auth.py", "content": "FIXED = True\n"},
+                    ),
+                ),
+            )
+        if self.main_calls == 2:
+            return ModelReply(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        "delegate-review",
+                        "delegate_subagent",
+                        {
+                            "role": "reviewer",
+                            "question": "审查 backend/auth.py 的改动风险，并说明下一步验证。",
+                            "focus": "backend change review",
+                            "paths": ["backend/auth.py"],
+                            "constraints": ["只读审查，不要改文件"],
+                        },
+                    ),
+                ),
+            )
+        if self.main_calls == 3:
+            return ModelReply(content=None, tool_calls=(full_test_call("test-1"),))
+        return ModelReply(content="已修复并通过测试。")
+
+
+class ResearcherSubAgentModel:
+    def __init__(self) -> None:
+        self.received_messages: list[list[dict[str, object]]] = []
+        self.received_tools: list[list[dict[str, object]]] = []
+
+    def complete(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> ModelReply:
+        self.received_messages.append([message.copy() for message in messages])
+        self.received_tools.append(tools)
+        request = json.dumps(messages, ensure_ascii=False)
+        if "You are a read-only subagent" in request:
+            return ModelReply(
+                content=json.dumps(
+                    {
+                        "taskId": "research-auth",
+                        "summary": "Login behavior lives in backend/auth.py and uses UserRepository.",
+                        "findings": [
+                            {
+                                "severity": "info",
+                                "evidence": "backend/auth.py",
+                                "detail": "The module delegates user lookup to backend.db.UserRepository.",
+                            }
+                        ],
+                        "artifacts": ["backend/auth.py", "backend/db.py"],
+                        "confidence": 0.78,
+                        "risks": ["Persistence is in-memory in this fixture."],
+                        "recommendedNextStep": "Main agent should inspect auth.py before editing.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if len(self.received_messages) == 1:
+            return ModelReply(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        "research-auth",
+                        "delegate_subagent",
+                        {
+                            "role": "researcher",
+                            "question": "登录功能在哪里实现，相关模块和现有模式是什么？",
+                            "focus": "login architecture",
+                            "paths": ["backend"],
+                        },
+                    ),
+                ),
+            )
+        return ModelReply(content="登录功能位于 backend/auth.py。")
+
+
+class TesterSubAgentModel:
+    def __init__(self) -> None:
+        self.received_messages: list[list[dict[str, object]]] = []
+        self.received_tools: list[list[dict[str, object]]] = []
+        self.subagent_requests: list[str] = []
+
+    def complete(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> ModelReply:
+        self.received_messages.append([message.copy() for message in messages])
+        self.received_tools.append(tools)
+        request = json.dumps(messages, ensure_ascii=False)
+        if "You are a read-only subagent" in request:
+            self.subagent_requests.append(request)
+            if len(self.subagent_requests) == 1:
+                return ModelReply(
+                    content=None,
+                    tool_calls=(
+                        full_test_call("tester-test"),
+                        ToolCall(
+                            "tester-write",
+                            "write_file",
+                            {"path": "should_not_exist.py", "content": "bad\n"},
+                        ),
+                    ),
+                )
+            return ModelReply(
+                content=json.dumps(
+                    {
+                        "taskId": "tester-auth",
+                        "summary": "Smoke tests ran and write_file was denied by tester permissions.",
+                        "findings": [],
+                        "artifacts": ["project_tests/test_smoke.py"],
+                        "confidence": 0.86,
+                        "risks": ["Only smoke coverage exists."],
+                        "recommendedNextStep": "Main agent should add or run broader tests if needed.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if len(self.received_messages) == 1:
+            return ModelReply(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        "tester-auth",
+                        "delegate_subagent",
+                        {
+                            "role": "tester",
+                            "question": "设计并运行当前项目的登录验证策略。",
+                            "focus": "login verification",
+                        },
+                    ),
+                ),
+            )
+        return ModelReply(content="测试策略已确认。")
+
+
 class BlockingExtension(BaseExtension):
     name = "blocker"
 
@@ -302,6 +567,190 @@ class AgentTests(unittest.TestCase):
             second_request = json.dumps(model.received_messages[1], ensure_ascii=False)
             self.assertIn("tool call blocked by extension", second_request)
             self.assertNotIn("hidden", second_request)
+
+    def test_task_state_exposes_a_visible_task_list(self) -> None:
+        state = TaskState(
+            "创建 Python 应用",
+            creation_task=True,
+            plan=["实现应用", "编写测试", "编写 README", "运行测试"],
+        )
+        state.update(
+            ToolCall(
+                "write-app",
+                "write_file",
+                {"path": "app.py", "content": "print('ok')\n"},
+            ),
+            "Wrote app.py",
+            success=True,
+        )
+
+        content = str(state.message(3)["content"])
+
+        self.assertIn("Task list:", content)
+        self.assertIn("- [current] 实现应用", content)
+        self.assertIn("- [pending] 编写测试", content)
+        self.assertIn("- [pending] 编写 README", content)
+
+    def test_default_task_list_has_a_single_current_item(self) -> None:
+        state = TaskState("分析复杂项目失败原因")
+
+        lines = state.task_list_lines()
+
+        self.assertEqual(sum("[current]" in line for line in lines), 1)
+        self.assertEqual(lines[0], "- [current] 检查相关文件")
+
+    def test_subagent_tool_is_not_offered_for_simple_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel([ModelReply(content="完成。")])
+
+            Agent(model, Workspace(Path(temp_dir))).run("查看 README")
+
+            tool_names = {tool["function"]["name"] for tool in model.received_tools[0]}
+            self.assertNotIn("delegate_subagent", tool_names)
+            request = json.dumps(model.received_messages[0], ensure_ascii=False)
+            self.assertNotIn("<subagent_policy>", request)
+
+    def test_complex_task_can_delegate_to_read_only_subagent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("frontend", "backend", "database", "tests"):
+                (root / directory).mkdir()
+            for index in range(30):
+                target = (
+                    root / "backend" / f"module_{index}.py"
+                    if index % 3 == 0
+                    else root / "frontend" / f"view_{index}.js"
+                    if index % 3 == 1
+                    else root / "database" / f"schema_{index}.sql"
+                )
+                target.write_text(f"content {index}\n", encoding="utf-8")
+            model = SubAgentOuterModel([])
+            events: list[str] = []
+            trace = JsonlTrace(root / "trace.jsonl")
+
+            answer = Agent(
+                model,
+                Workspace(root),
+                trace=trace,
+                on_event=events.append,
+            ).run("分析这个大型复杂项目为什么运行失败，分别考虑前端、后端和数据库")
+
+            self.assertEqual(answer, "主要问题在后端配置导入。")
+            main_tools = {tool["function"]["name"] for tool in model.received_tools[0]}
+            subagent_tools = {
+                tool["function"]["name"] for tool in model.received_tools[1]
+            }
+            self.assertIn("delegate_subagent", main_tools)
+            self.assertEqual(
+                subagent_tools,
+                {"list_files", "read_file", "search_text", "run_command"},
+            )
+            first_request = json.dumps(model.received_messages[0], ensure_ascii=False)
+            final_request = json.dumps(model.received_messages[-1], ensure_ascii=False)
+            self.assertIn("<subagent_policy>", first_request)
+            self.assertIn("<subagent_report", final_request)
+            self.assertIn("taskId", final_request)
+            self.assertIn("confidence", final_request)
+            self.assertIn("backend/app.py imports missing_config", final_request)
+            self.assertTrue(any(event.startswith("[SubAgent]") for event in events))
+            trace_events = [
+                json.loads(line)
+                for line in trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                any(event["event"] == "subagent_start" for event in trace_events)
+            )
+            self.assertTrue(
+                any(event["event"] == "subagent_complete" for event in trace_events)
+            )
+
+    def test_researcher_subagent_is_read_search_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("frontend", "backend", "database", "tests"):
+                (root / directory).mkdir()
+            (root / "backend" / "auth.py").write_text("def login(): pass\n", encoding="utf-8")
+            (root / "backend" / "db.py").write_text("class UserRepository: pass\n", encoding="utf-8")
+            (root / "frontend" / "app.js").write_text("export {}\n", encoding="utf-8")
+            (root / "database" / "schema.sql").write_text("select 1;\n", encoding="utf-8")
+            model = ResearcherSubAgentModel()
+
+            answer = Agent(model, Workspace(root)).run(
+                "分析这个大型复杂项目的登录功能现在在哪里实现，相关模块有哪些"
+            )
+
+            self.assertEqual(answer, "登录功能位于 backend/auth.py。")
+            main_tools = {tool["function"]["name"] for tool in model.received_tools[0]}
+            researcher_tools = {
+                tool["function"]["name"] for tool in model.received_tools[1]
+            }
+            self.assertIn("delegate_subagent", main_tools)
+            self.assertEqual(researcher_tools, {"list_files", "read_file", "search_text"})
+            researcher_request = json.dumps(model.received_messages[1], ensure_ascii=False)
+            self.assertIn("researcher", researcher_request)
+            self.assertIn("architecture constraints", researcher_request)
+
+    def test_tester_subagent_can_run_tests_but_cannot_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("frontend", "backend", "database"):
+                (root / directory).mkdir()
+            (root / "backend" / "auth.py").write_text("VALUE = True\n", encoding="utf-8")
+            (root / "frontend" / "app.js").write_text("export {}\n", encoding="utf-8")
+            (root / "database" / "schema.sql").write_text("select 1;\n", encoding="utf-8")
+            write_smoke_suite(root)
+            model = TesterSubAgentModel()
+
+            answer = Agent(model, Workspace(root)).run(
+                "分析这个大型复杂项目的登录验证策略，必要时运行测试"
+            )
+
+            self.assertEqual(answer, "测试策略已确认。")
+            tester_tools = {tool["function"]["name"] for tool in model.received_tools[1]}
+            self.assertEqual(
+                tester_tools,
+                {"list_files", "read_file", "search_text", "run_command"},
+            )
+            self.assertFalse((root / "should_not_exist.py").exists())
+            second_subagent_request = model.subagent_requests[1]
+            self.assertIn("tester subagents may not call write_file", second_subagent_request)
+            final_request = json.dumps(model.received_messages[-1], ensure_ascii=False)
+            self.assertIn("Smoke tests ran", final_request)
+
+    def test_complex_changes_require_reviewer_before_final_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for directory in ("frontend", "backend", "database"):
+                (root / directory).mkdir()
+            (root / "backend" / "auth.py").write_text("FIXED = False\n", encoding="utf-8")
+            (root / "frontend" / "app.js").write_text("console.log('ui')\n", encoding="utf-8")
+            (root / "database" / "schema.sql").write_text("select 1;\n", encoding="utf-8")
+            write_smoke_suite(root)
+            model = ReviewerGateModel()
+            trace = JsonlTrace(root / "trace.jsonl")
+
+            answer = Agent(
+                model,
+                Workspace(root),
+                trace=trace,
+            ).run("分析这个大型复杂项目运行失败，涉及前端、后端、数据库，并修复问题")
+
+            self.assertEqual(answer, "已修复并通过测试。")
+            self.assertIn("delegate_subagent", model.main_tool_names[0])
+            self.assertIn("run_command", model.main_tool_names[1])
+            self.assertIn("delegate_subagent", model.main_tool_names[1])
+            self.assertIn("run_command", model.main_tool_names[2])
+            self.assertIn("<subagent_review_gate>", model.main_requests[1])
+            self.assertTrue(model.subagent_requests)
+            trace_events = [
+                json.loads(line)
+                for line in trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            names = {event["event"] for event in trace_events}
+            self.assertIn("subagent_review_pending", names)
+            self.assertIn("subagent_review_required", names)
+            self.assertIn("subagent_review_auto_delegated", names)
+            self.assertIn("subagent_review_completed", names)
 
     def test_context_pack_compacts_old_tool_exchanges_but_keeps_recent_result(
         self,

@@ -103,6 +103,47 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(loaded.messages[0].role, "user")
             self.assertEqual(loaded.messages[1].events, ["[工具] list_files"])
 
+    def test_chat_store_preserves_tree_branches_from_history_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "conversations.json"
+            store = ChatStore(path)
+            conversation = store.create_conversation("project-1")
+
+            first_branch = store.append_pair(
+                conversation.id,
+                user_message="方案 A",
+                assistant_message="A 结果",
+                events=[],
+            )
+            branch_point = first_branch.current_message_id
+            store.append_pair(
+                conversation.id,
+                user_message="继续 A",
+                assistant_message="A 后续",
+                events=[],
+            )
+            store.checkout_message(conversation.id, branch_point)
+            store.append_pair(
+                conversation.id,
+                user_message="尝试 B",
+                assistant_message="B 结果",
+                events=[],
+            )
+
+            loaded = ChatStore(path).get(conversation.id)
+            current_contents = [message.content for message in loaded.current_messages()]
+            all_contents = [message.content for message in loaded.messages]
+
+            self.assertEqual(current_contents, ["方案 A", "A 结果", "尝试 B", "B 结果"])
+            self.assertIn("继续 A", all_contents)
+            self.assertEqual(len(loaded.messages), 6)
+            children = [
+                message
+                for message in loaded.messages
+                if message.parent_id == branch_point
+            ]
+            self.assertEqual({message.content for message in children}, {"继续 A", "尝试 B"})
+
     def test_chat_store_pins_and_deletes_conversations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "conversations.json"
@@ -141,6 +182,38 @@ class ChatTests(unittest.TestCase):
             saved_messages = state["conversations"][0]["messages"]
             self.assertEqual(saved_messages[0]["content"], "为我介绍一下这个项目")
             self.assertIn("已处理", saved_messages[1]["content"])
+            self.assertIn("message_tree", state["conversations"][0])
+            self.assertTrue(saved_messages[0]["id"])
+            self.assertEqual(saved_messages[1]["parent_id"], saved_messages[0]["id"])
+
+    def test_chat_app_can_checkout_history_node_and_continue_new_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            project = Path(temp_dir) / "project"
+            project.mkdir()
+            app = FakeChatApp(
+                data_dir,
+                Settings(api_key="test-key", model="test-model"),
+            )
+            saved_project = app.add_project(str(project))
+            conversation = app.create_conversation(str(saved_project["id"]))
+
+            first = app.send_message(str(conversation["id"]), "方案 A")["conversation"]
+            branch_point = first["current_message_id"]
+            app.send_message(str(conversation["id"]), "继续 A")
+
+            self.assertIn(str(conversation["id"]), app._agents)
+            checked_out = app.checkout_message(str(conversation["id"]), branch_point)
+            self.assertNotIn(str(conversation["id"]), app._agents)
+            self.assertEqual([item["content"] for item in checked_out["messages"]], ["方案 A", "已处理：方案 A"])
+
+            branched = app.send_message(str(conversation["id"]), "尝试 B")["conversation"]
+            visible = [item["content"] for item in branched["messages"]]
+            full_tree = [item["content"] for item in branched["message_tree"]]
+
+            self.assertEqual(visible, ["方案 A", "已处理：方案 A", "尝试 B", "已处理：尝试 B"])
+            self.assertIn("继续 A", full_tree)
+            self.assertEqual(len(branched["message_tree"]), 6)
 
     def test_send_message_persists_user_message_before_agent_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -224,6 +297,9 @@ class ChatTests(unittest.TestCase):
     def test_chat_ui_has_day_navigation_and_collapsed_finished_events(self) -> None:
         self.assertIn('id="dayNav"', INDEX_HTML)
         self.assertIn("renderDayNav", INDEX_HTML)
+        self.assertIn("renderSessionTree", INDEX_HTML)
+        self.assertIn("data-message-checkout", INDEX_HTML)
+        self.assertIn("/api/conversations/checkout", INDEX_HTML)
         self.assertIn("daysForMessages", INDEX_HTML)
         self.assertIn("day-separator", INDEX_HTML)
         self.assertIn("scrollIntoView", INDEX_HTML)

@@ -6,10 +6,12 @@ import json
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Protocol, Sequence
 
 from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.skills import SkillRegistry
+from coding_agent.tools.registry import ToolRegistry
 from coding_agent.trace import Trace
 from coding_agent.workspace import Workspace
 
@@ -42,6 +44,29 @@ class ContextOutputRecord:
     lines: int
     success: bool
     summary: str
+
+
+@dataclass(frozen=True)
+class SubagentTask:
+    id: str
+    role: str
+    objective: str
+    context: tuple[str, ...]
+    constraints: tuple[str, ...]
+    allowed_tools: tuple[str, ...]
+    expected_output: str
+    status: str = "pending"
+
+
+@dataclass(frozen=True)
+class SubagentResult:
+    task_id: str
+    summary: str
+    findings: tuple[dict[str, object], ...]
+    artifacts: tuple[str, ...]
+    confidence: float
+    risks: tuple[str, ...]
+    recommended_next_step: str
 
 
 class AgentExtension(Protocol):
@@ -385,6 +410,405 @@ class SkillSelectionExtension(BaseExtension):
         context.trace.record("skills_selected", skills=names)
         context.emit(f"[技能] 已启用：{', '.join(names)}")
         return [skill.message() for skill in selected]
+
+
+class SubAgentExtension(BaseExtension):
+    name = "subagents"
+    DELEGATE_TOOL = "delegate_subagent"
+    BASE_TOOLS = {"list_files", "read_file", "search_text"}
+    TEST_TOOLS = {"run_command"}
+    ROLES = {"researcher", "tester", "reviewer"}
+
+    def __init__(
+        self,
+        model: Any | None = None,
+        *,
+        max_steps: int = 4,
+        max_tool_characters: int = 8_000,
+        complexity_file_threshold: int = 25,
+    ) -> None:
+        self.model = model
+        self.max_steps = max_steps
+        self.max_tool_characters = max_tool_characters
+        self.complexity_file_threshold = complexity_file_threshold
+        self._enabled = False
+        self._reason = ""
+        self._recommended_focuses: list[str] = []
+        self._change_revision = 0
+        self._reviewed_revision = 0
+
+    def on_session_start(self, context: ExtensionContext) -> None:
+        self._enabled, self._reason = _should_enable_subagents(
+            context.task,
+            context.workspace,
+            file_threshold=self.complexity_file_threshold,
+        )
+        self._recommended_focuses = _recommended_subagent_focuses(
+            context.task,
+            context.workspace,
+        )
+        self._change_revision = 0
+        self._reviewed_revision = 0
+
+    def before_llm_call(
+        self,
+        context: ExtensionContext,
+        *,
+        step: int,
+        messages: list[Message],
+        tools: list[ToolDefinition],
+    ) -> tuple[list[Message], list[ToolDefinition]]:
+        if not self._review_required:
+            return messages, tools
+        gate = {
+            "role": "system",
+            "content": (
+                "<subagent_review_gate>\n"
+                "A complex task changed project files. Before accepting verification, "
+                "delegate a reviewer subagent with role='reviewer' to inspect the "
+                "current patch or changed files. The reviewer is read/test only and "
+                "does not decide whether to ship. The main agent must judge the "
+                "evidence, make any needed fixes, then run final verification itself. "
+                "If you call run_command before reviewer review is complete, the "
+                "framework will convert that request into a reviewer delegation first.\n"
+                "</subagent_review_gate>"
+            ),
+        }
+        context.trace.record(
+            "subagent_review_required",
+            step=step,
+            change_revision=self._change_revision,
+        )
+        return [*messages, gate], tools
+
+    @property
+    def _review_required(self) -> bool:
+        return self._enabled and self._change_revision > self._reviewed_revision
+
+    def inject_context(self, context: ExtensionContext) -> list[Message]:
+        if not self._enabled:
+            return []
+        focuses = self._recommended_focuses or ["general"]
+        context.trace.record(
+            "subagent_policy_enabled",
+            reason=self._reason,
+            recommended_focuses=focuses,
+        )
+        context.emit(
+            f"[SubAgent] 已启用委派策略：{self._reason}；建议关注 {', '.join(focuses)}"
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "<subagent_policy>\n"
+                    "Three bounded SubAgent roles are available because this task or workspace "
+                    "appears complex. The main agent must decide whether delegation actually "
+                    "reduces context load or improves quality. Do not delegate simple single-file work.\n"
+                    f"Recommended delegation focuses for this task: {', '.join(focuses)}.\n"
+                    "Use role='researcher' to locate implementations, related modules, existing "
+                    "patterns, architecture constraints, and risks. Researcher is read/search only.\n"
+                    "Use role='tester' to design a verification strategy, identify missing coverage, "
+                    "run allowed tests, and explain failure logs. Tester cannot edit files.\n"
+                    "Use role='reviewer' after non-trivial changes to inspect the patch, evidence, "
+                    "risks, and next verification step. Reviewer can read/search and run allowed "
+                    "tests, but cannot edit files.\n"
+                    "Subagents cannot create other subagents and never make the final decision. "
+                    "The main agent remains responsible for judging reports, applying fixes, "
+                    "running final verification, and producing the user-facing answer.\n"
+                    "</subagent_policy>"
+                ),
+            }
+        ]
+
+    def tool_definitions(self, context: ExtensionContext) -> list[ToolDefinition]:
+        if not self._enabled or self.model is None:
+            return []
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": self.DELEGATE_TOOL,
+                    "description": (
+                        "Delegate one bounded subagent with its own context. Use researcher "
+                        "for read-only architecture or module discovery, tester for validation "
+                        "strategy and allowed test execution, and reviewer for patch review. "
+                        "Use only when context separation is worth the cost."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "enum": ["researcher", "tester", "reviewer"],
+                                "description": (
+                                    "researcher reads/searches architecture; tester plans/runs "
+                                    "allowed tests; reviewer inspects changes before final verification."
+                                ),
+                            },
+                            "question": {
+                                "type": "string",
+                                "description": "The specific question this subagent should answer.",
+                            },
+                            "focus": {
+                                "type": "string",
+                                "description": "Short scope label for this delegation.",
+                            },
+                            "paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional workspace-relative paths to prioritize.",
+                            },
+                            "search_terms": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional terms the subagent should search for.",
+                            },
+                            "constraints": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Constraints the subagent must obey.",
+                            },
+                            "expected_output": {
+                                "type": "string",
+                                "description": "Expected structured result shape.",
+                            },
+                        },
+                        "required": ["role", "question"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    def execute_tool(
+        self,
+        context: ExtensionContext,
+        *,
+        step: int,
+        call: Any,
+    ) -> ToolResult | None:
+        if call.name != self.DELEGATE_TOOL:
+            return None
+        if not self._enabled or self.model is None:
+            return ToolResult(
+                "Subagent delegation is not enabled for this task.", success=False
+            )
+        role = _normalize_subagent_role(call.arguments.get("role"))
+        if role not in self.ROLES:
+            return ToolResult(f"Unsupported subagent role: {role}", success=False)
+        question = str(call.arguments.get("question", "")).strip()
+        focus = str(call.arguments.get("focus", role)).strip() or role
+        paths = _string_sequence(call.arguments.get("paths"))
+        search_terms = _string_sequence(call.arguments.get("search_terms"))
+        constraints = _string_sequence(call.arguments.get("constraints"))
+        expected_output = str(
+            call.arguments.get(
+                "expected_output",
+                _default_subagent_expected_output(role),
+            )
+        )
+        task = SubagentTask(
+            id=str(getattr(call, "id", "")) or _subagent_task_id(role, question),
+            role=role,
+            objective=question,
+            context=tuple([*paths, *search_terms]),
+            constraints=tuple(constraints),
+            allowed_tools=tuple(sorted(self._allowed_tools_for_role(role))),
+            expected_output=expected_output,
+            status="running",
+        )
+        context.emit(f"[SubAgent] {role}：{_compact_inline(question, 120)}")
+        context.trace.record(
+            "subagent_start",
+            step=step,
+            task=_subagent_task_data(task),
+        )
+        report = self._run_subagent(
+            context,
+            step=step,
+            task=task,
+            focus=focus,
+        )
+        if role == "reviewer":
+            self._reviewed_revision = self._change_revision
+            context.trace.record(
+                "subagent_review_completed",
+                step=step,
+                change_revision=self._change_revision,
+            )
+        context.trace.record("subagent_complete", step=step, role=role)
+        return ToolResult(report, success=True)
+
+    def before_tool_call(
+        self,
+        context: ExtensionContext,
+        *,
+        step: int,
+        call: Any,
+    ) -> Any | None:
+        if self._review_required and getattr(call, "name", "") == "run_command":
+            argv = getattr(call, "arguments", {}).get("argv", [])
+            command = " ".join(str(part) for part in argv) if isinstance(argv, list) else str(argv)
+            context.trace.record(
+                "subagent_review_auto_delegated",
+                step=step,
+                change_revision=self._change_revision,
+                attempted_tool="run_command",
+                attempted_command=_compact_inline(command, 180),
+            )
+            return SimpleNamespace(
+                id=getattr(call, "id", "review-before-verification"),
+                name=self.DELEGATE_TOOL,
+                arguments={
+                    "role": "reviewer",
+                    "question": (
+                        "Review the changed files before final verification. "
+                        f"The main agent attempted to run: {command or 'run_command'}"
+                    ),
+                    "focus": "pre-verification review",
+                    "constraints": [
+                        "Read and test only; do not edit files.",
+                        "Report evidence, risks, confidence, and the next verification step.",
+                    ],
+                },
+            )
+        return call
+
+    def after_tool_call(
+        self,
+        context: ExtensionContext,
+        *,
+        step: int,
+        call: Any,
+        result: ToolResult,
+    ) -> ToolResult:
+        if (
+            self._enabled
+            and result.success
+            and getattr(call, "name", "") in {"write_file", "apply_patch"}
+        ):
+            self._change_revision += 1
+            context.trace.record(
+                "subagent_review_pending",
+                step=step,
+                change_revision=self._change_revision,
+                tool=getattr(call, "name", "unknown"),
+            )
+        return result
+
+    def _run_subagent(
+        self,
+        context: ExtensionContext,
+        *,
+        step: int,
+        task: SubagentTask,
+        focus: str,
+    ) -> str:
+        registry = ToolRegistry(context.workspace)
+        allowed_tool_names = self._allowed_tools_for_role(task.role)
+        subagent_tools = [
+            definition
+            for definition in registry.definitions
+            if _tool_name(definition) in allowed_tool_names
+        ]
+        messages: list[Message] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a read-only subagent. You have an independent context "
+                    "for one focused investigation. Use only the provided tools. "
+                    + _subagent_role_instructions(task.role)
+                    + " Return one JSON object with taskId, summary, findings, "
+                    "artifacts, confidence, risks, and recommendedNextStep. Do not ask "
+                    "the user questions."
+                ),
+            },
+            {
+                "role": "user",
+                "content": _subagent_assignment(
+                    task=task,
+                    focus=focus,
+                ),
+            },
+        ]
+        last_content = ""
+        for substep in range(1, self.max_steps + 1):
+            try:
+                reply = self.model.complete(messages, subagent_tools)
+            except Exception as error:
+                context.trace.record(
+                    "subagent_error",
+                    step=step,
+                    substep=substep,
+                    role=task.role,
+                    error_type=type(error).__name__,
+                )
+                return _subagent_report(
+                    task=task,
+                    focus=focus,
+                    status="failed",
+                    content=f"Subagent failed before producing a report: {error}",
+                )
+            last_content = str(getattr(reply, "content", "") or last_content)
+            tool_calls = tuple(getattr(reply, "tool_calls", ()) or ())
+            context.trace.record(
+                "subagent_model_reply",
+                step=step,
+                substep=substep,
+                role=task.role,
+                tools=[getattr(tool_call, "name", "unknown") for tool_call in tool_calls],
+            )
+            if not tool_calls:
+                return _subagent_report(
+                    task=task,
+                    focus=focus,
+                    status="complete",
+                    content=last_content or "No findings reported.",
+                )
+            messages.append(_assistant_tool_message(reply))
+            for tool_call in tool_calls:
+                tool_name = str(getattr(tool_call, "name", "unknown"))
+                context.emit(f"[SubAgent:{task.role}] {tool_name}")
+                if tool_name not in allowed_tool_names:
+                    result = f"ERROR: {task.role} subagents may not call {tool_name}"
+                    success = False
+                else:
+                    try:
+                        result = registry.execute(
+                            tool_name,
+                            getattr(tool_call, "arguments", {}),
+                        )
+                        success = True
+                    except (OSError, ValueError) as error:
+                        result = f"ERROR: {error}"
+                        success = False
+                context.trace.record(
+                    "subagent_tool_result",
+                    step=step,
+                    substep=substep,
+                    role=task.role,
+                    tool=tool_name,
+                    success=success,
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(getattr(tool_call, "id", "")),
+                        "content": _limit_text(result, self.max_tool_characters),
+                    }
+                )
+        return _subagent_report(
+            task=task,
+            focus=focus,
+            status="max_steps_reached",
+            content=last_content or "Subagent reached its step budget without a final report.",
+        )
+
+    def _allowed_tools_for_role(self, role: str) -> set[str]:
+        if role == "researcher":
+            return set(self.BASE_TOOLS)
+        return {*self.BASE_TOOLS, *self.TEST_TOOLS}
 
 
 class ContextPackExtension(BaseExtension):
@@ -831,6 +1255,306 @@ def _tool_name(definition: ToolDefinition) -> str:
         return ""
     name = function.get("name")
     return name if isinstance(name, str) else ""
+
+
+def _should_enable_subagents(
+    task: str,
+    workspace: Workspace,
+    *,
+    file_threshold: int,
+) -> tuple[bool, str]:
+    normalized = task.casefold()
+    explicit = any(
+        marker in normalized
+        for marker in ("subagent", "sub-agent", "子agent", "子 agent", "多代理")
+    )
+    complex_markers = (
+        "大型",
+        "复杂",
+        "多模块",
+        "全局",
+        "全面分析",
+        "架构",
+        "运行失败",
+        "为什么失败",
+        "性能",
+        "安全",
+        "前端",
+        "后端",
+        "数据库",
+        "large",
+        "complex",
+        "monorepo",
+        "architecture",
+        "frontend",
+        "backend",
+        "database",
+        "performance",
+        "security",
+    )
+    marker_score = sum(1 for marker in complex_markers if marker in normalized)
+    profile = _workspace_profile(workspace, limit=max(file_threshold + 10, 80))
+    domain_score = len(profile["domains"])
+    file_count = int(profile["file_count"])
+    if explicit:
+        return True, "用户明确提到 SubAgent"
+    if marker_score >= 2 and (file_count >= file_threshold or domain_score >= 2):
+        return True, (
+            f"任务复杂度标记 {marker_score} 个，工作区约 {file_count} 个文件，"
+            f"领域 {domain_score} 个"
+        )
+    if marker_score >= 4:
+        return True, f"任务本身包含 {marker_score} 个复杂度标记"
+    return False, "任务规模不足，无需委派"
+
+
+def _workspace_profile(workspace: Workspace, *, limit: int) -> dict[str, object]:
+    protected = {".git", ".venv", ".coding-agent", "__pycache__"}
+    domains: set[str] = set()
+    file_count = 0
+    try:
+        iterator = workspace.root.rglob("*")
+        for path in iterator:
+            if any(part in protected for part in path.relative_to(workspace.root).parts):
+                continue
+            if not path.is_file():
+                continue
+            file_count += 1
+            relative = path.relative_to(workspace.root).as_posix().casefold()
+            if any(part in relative for part in ("frontend", "client", "web", "ui")):
+                domains.add("frontend")
+            if any(part in relative for part in ("backend", "server", "api", "service")):
+                domains.add("backend")
+            if any(part in relative for part in ("db", "database", "migration", "schema")):
+                domains.add("database")
+            if any(part in relative for part in ("test", "spec")):
+                domains.add("tests")
+            if file_count >= limit:
+                break
+    except OSError:
+        return {"file_count": file_count, "domains": sorted(domains)}
+    return {"file_count": file_count, "domains": sorted(domains)}
+
+
+def _recommended_subagent_focuses(task: str, workspace: Workspace) -> list[str]:
+    normalized = task.casefold()
+    profile = _workspace_profile(workspace, limit=120)
+    roles: list[str] = []
+    domain_to_role = {
+        "frontend": "frontend",
+        "backend": "backend",
+        "database": "database",
+        "tests": "tests",
+    }
+    for domain in profile["domains"]:
+        role = domain_to_role.get(str(domain))
+        if role is not None:
+            roles.append(role)
+    keyword_roles = (
+        ("frontend", ("前端", "frontend", "ui", "web")),
+        ("backend", ("后端", "backend", "api", "server", "service")),
+        ("database", ("数据库", "database", "db", "schema", "migration")),
+        ("tests", ("测试", "test", "pytest", "unittest", "失败")),
+        ("performance", ("性能", "performance", "slow", "latency", "速度")),
+        ("security", ("安全", "security", "auth", "权限", "登录")),
+        ("architecture", ("架构", "architecture", "模块", "依赖")),
+    )
+    for role, markers in keyword_roles:
+        if any(marker in normalized for marker in markers):
+            roles.append(role)
+    return _unique(roles)[:4]
+
+
+def _string_sequence(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_compact_inline(str(item), 160) for item in value if str(item).strip()]
+
+
+def _normalize_subagent_role(value: object) -> str:
+    role = str(value or "reviewer").strip().casefold()
+    return role
+
+
+def _default_subagent_expected_output(role: str) -> str:
+    if role == "researcher":
+        return (
+            "JSON object with summary, findings, artifacts, confidence, risks, "
+            "recommendedNextStep. Focus on implementation locations, related modules, "
+            "existing patterns, architecture constraints, and risk points."
+        )
+    if role == "tester":
+        return (
+            "JSON object with summary, findings, artifacts, confidence, risks, "
+            "recommendedNextStep. Focus on verification strategy, missing coverage, "
+            "test commands/results, and failure-log interpretation."
+        )
+    return (
+        "JSON object with summary, findings, artifacts, confidence, risks, "
+        "recommendedNextStep. Focus on patch correctness, evidence, residual risks, "
+        "and the next verification step."
+    )
+
+
+def _subagent_role_instructions(role: str) -> str:
+    if role == "researcher":
+        return (
+            "As researcher, locate where the requested behavior is implemented, "
+            "identify related modules and existing project patterns, summarize "
+            "architecture constraints, and call out risks. You cannot edit files, "
+            "run commands, or make final decisions."
+        )
+    if role == "tester":
+        return (
+            "As tester, design the verification strategy, identify missing coverage, "
+            "run only allowed read-only test commands, and explain failure logs. "
+            "You cannot edit files or make final decisions; propose test additions "
+            "as recommendations only."
+        )
+    return (
+        "As reviewer, inspect the current change or proposed patch, evaluate evidence "
+        "and residual risks, and recommend the next verification step. You cannot edit "
+        "files or make final decisions."
+    )
+
+
+def _subagent_task_id(role: str, objective: str) -> str:
+    digest = hashlib.sha1(f"{role}\n{objective}".encode("utf-8")).hexdigest()[:10]
+    return f"{role}-{digest}"
+
+
+def _subagent_task_data(task: SubagentTask) -> dict[str, object]:
+    return {
+        "id": task.id,
+        "role": task.role,
+        "objective": task.objective,
+        "context": list(task.context),
+        "constraints": list(task.constraints),
+        "allowedTools": list(task.allowed_tools),
+        "expectedOutput": task.expected_output,
+        "status": task.status,
+    }
+
+
+def _subagent_assignment(
+    *,
+    task: SubagentTask,
+    focus: str,
+) -> str:
+    payload = _subagent_task_data(task)
+    payload["focus"] = focus
+    return (
+        "Review this task for the main agent. The main agent may accept or reject "
+        "your findings based on evidence quality.\n\n"
+        "SubagentTask:\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "Return only one JSON object matching SubagentResult:\n"
+        "{\n"
+        '  "taskId": string,\n'
+        '  "summary": string,\n'
+        '  "findings": [{"severity": string, "evidence": string, "detail": string}],\n'
+        '  "artifacts": [string],\n'
+        '  "confidence": number,\n'
+        '  "risks": [string],\n'
+        '  "recommendedNextStep": string\n'
+        "}"
+    )
+
+
+def _subagent_report(
+    *,
+    task: SubagentTask,
+    focus: str,
+    status: str,
+    content: str,
+) -> str:
+    result = _subagent_result_data(
+        _normalize_subagent_result(task, status=status, content=content)
+    )
+    return "\n".join(
+        [
+            (
+                f"<subagent_report task_id=\"{task.id}\" role=\"{task.role}\" "
+                f"focus=\"{focus}\" status=\"{status}\">"
+            ),
+            _limit_text(json.dumps(result, ensure_ascii=False, indent=2), 4_000),
+            "</subagent_report>",
+        ]
+    )
+
+
+def _normalize_subagent_result(
+    task: SubagentTask,
+    *,
+    status: str,
+    content: str,
+) -> SubagentResult:
+    data: dict[str, object] = {}
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            data = parsed
+    except json.JSONDecodeError:
+        data = {}
+    findings = data.get("findings", ())
+    if not isinstance(findings, list):
+        findings = []
+    normalized_findings: list[dict[str, object]] = [
+        item for item in findings if isinstance(item, dict)
+    ]
+    artifacts = tuple(_string_sequence(data.get("artifacts")))
+    risks = tuple(_string_sequence(data.get("risks")))
+    confidence = data.get("confidence")
+    if isinstance(confidence, (int, float)):
+        normalized_confidence = max(0.0, min(float(confidence), 1.0))
+    else:
+        normalized_confidence = 0.5 if status == "complete" else 0.0
+    summary = str(data.get("summary") or content or "No findings reported.").strip()
+    recommended_next_step = str(data.get("recommendedNextStep") or "").strip()
+    if not recommended_next_step:
+        recommended_next_step = "Main agent should judge these findings and run final verification."
+    return SubagentResult(
+        task_id=str(data.get("taskId") or task.id),
+        summary=_limit_text(summary, 1_600),
+        findings=tuple(normalized_findings),
+        artifacts=artifacts,
+        confidence=normalized_confidence,
+        risks=risks,
+        recommended_next_step=_limit_text(recommended_next_step, 400),
+    )
+
+
+def _subagent_result_data(result: SubagentResult) -> dict[str, object]:
+    return {
+        "taskId": result.task_id,
+        "summary": result.summary,
+        "findings": list(result.findings),
+        "artifacts": list(result.artifacts),
+        "confidence": result.confidence,
+        "risks": list(result.risks),
+        "recommendedNextStep": result.recommended_next_step,
+    }
+
+
+def _assistant_tool_message(reply: Any) -> Message:
+    return {
+        "role": "assistant",
+        "content": getattr(reply, "content", None),
+        "tool_calls": [
+            {
+                "id": str(getattr(call, "id", "")),
+                "type": "function",
+                "function": {
+                    "name": str(getattr(call, "name", "unknown")),
+                    "arguments": json.dumps(
+                        getattr(call, "arguments", {}),
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+            for call in tuple(getattr(reply, "tool_calls", ()) or ())
+        ],
+    }
 
 
 def _messages_characters(messages: list[Message]) -> int:

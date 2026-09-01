@@ -32,7 +32,19 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (TypeError, ValueError):
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_stdio()
     args = _build_parser().parse_args(argv)
     try:
         workspace = Workspace(args.workspace)

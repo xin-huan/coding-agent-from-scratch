@@ -40,3 +40,13 @@ The older v2/v3 single-task context manager and read cache experiments have been
 ## Extensions
 
 The agent exposes lifecycle hooks in `src/coding_agent/extensions.py` so new framework behavior can be added without editing the core loop. Extensions can inject context, add tool definitions, observe LLM calls, subscribe to context compaction, intercept or implement tool calls, and save state at session end. Project memory, skill selection, and context packing are now ordinary extensions.
+
+## Tasks and Subagents
+
+Every run exposes a lightweight task list through live `[任务]` events and the runtime `<task_state>`. From-scratch project work uses the reviewed implementation plan as its task list; other work gets a default inspect/change/verify/finalize list.
+
+The default `SubAgentExtension` enables `delegate_subagent` only when the request or workspace appears complex enough, such as multi-domain failure analysis, large projects, architecture reviews, performance/security investigations, or an explicit subagent request. The system intentionally supports only three bounded roles: `researcher` for read-only module and architecture discovery, `tester` for verification strategy and restricted test execution, and `reviewer` for patch review after non-trivial changes. None of them can edit files or make the final decision. After complex file changes, final verification is gated: a premature verification command is converted into reviewer delegation first, then the main agent judges the report, fixes anything needed, and runs verification itself.
+
+## Tree Sessions
+
+Chat history is stored as a message tree instead of only a flat list. Each message has an `id` and `parent_id`, and each conversation tracks `current_message_id`. The UI renders the current branch as normal chat while preserving the full `message_tree`, so users can jump back to an earlier node and continue a new branch without deleting the old attempt.

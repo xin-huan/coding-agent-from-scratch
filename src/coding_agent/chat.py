@@ -29,9 +29,13 @@ class ChatMessage:
     content: str
     events: list[str] = field(default_factory=list)
     created_at: str = ""
+    id: str = ""
+    parent_id: str = ""
 
     def to_data(self) -> dict[str, object]:
         return {
+            "id": self.id,
+            "parent_id": self.parent_id,
             "role": self.role,
             "content": self.content,
             "events": self.events,
@@ -50,17 +54,21 @@ class ChatMessage:
             content=str(data.get("content", "")),
             events=[str(event) for event in events],
             created_at=str(data.get("created_at", "")),
+            id=str(data.get("id", "")),
+            parent_id=str(data.get("parent_id", "")),
         )
 
 
 @dataclass
 class RunningConversation:
     started_at: str
+    user_message_id: str = ""
     events: list[str] = field(default_factory=list)
 
     def to_data(self) -> dict[str, object]:
         return {
             "started_at": self.started_at,
+            "user_message_id": self.user_message_id,
             "events": list(self.events),
         }
 
@@ -74,6 +82,7 @@ class Conversation:
     created_at: str = ""
     updated_at: str = ""
     pinned: bool = False
+    current_message_id: str = ""
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -81,10 +90,30 @@ class Conversation:
             "project_id": self.project_id,
             "title": self.title,
             "messages": [message.to_data() for message in self.messages],
+            "current_message_id": self.current_message_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "pinned": self.pinned,
         }
+
+    def current_messages(self) -> list[ChatMessage]:
+        if not self.messages:
+            return []
+        by_id = {message.id: message for message in self.messages if message.id}
+        current_id = self.current_message_id
+        if current_id not in by_id:
+            current_id = self.messages[-1].id
+        path: list[ChatMessage] = []
+        seen: set[str] = set()
+        while current_id and current_id in by_id and current_id not in seen:
+            seen.add(current_id)
+            message = by_id[current_id]
+            path.append(message)
+            current_id = message.parent_id
+        return list(reversed(path))
+
+    def contains_message(self, message_id: str) -> bool:
+        return any(message.id == message_id for message in self.messages)
 
     @classmethod
     def from_data(cls, data: object) -> "Conversation | None":
@@ -95,6 +124,10 @@ class Conversation:
             for item in data.get("messages", [])
             if (message := ChatMessage.from_data(item)) is not None
         ]
+        current_message_id = _ensure_message_tree(
+            messages,
+            str(data.get("current_message_id", "")),
+        )
         return cls(
             id=str(data.get("id", "")),
             project_id=str(data.get("project_id", "")),
@@ -103,7 +136,26 @@ class Conversation:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             pinned=bool(data.get("pinned", False)),
+            current_message_id=current_message_id,
         )
+
+
+def _ensure_message_tree(
+    messages: list[ChatMessage],
+    current_message_id: str,
+) -> str:
+    seen: set[str] = set()
+    previous_id = ""
+    for message in messages:
+        if not message.id or message.id in seen:
+            message.id = uuid4().hex
+        seen.add(message.id)
+        if not message.parent_id and previous_id:
+            message.parent_id = previous_id
+        previous_id = message.id
+    if current_message_id and current_message_id in seen:
+        return current_message_id
+    return messages[-1].id if messages else ""
 
 
 class ChatStore:
@@ -161,15 +213,41 @@ class ChatStore:
         del self.conversations[conversation_id]
         self.save()
 
-    def append_user_message(self, conversation_id: str, content: str) -> Conversation:
+    def checkout_message(self, conversation_id: str, message_id: str) -> Conversation:
         conversation = self.get(conversation_id)
+        if message_id and not conversation.contains_message(message_id):
+            raise KeyError(f"Message not found: {message_id}")
+        conversation.current_message_id = message_id
+        conversation.updated_at = _now()
+        self.save()
+        return conversation
+
+    def append_user_message(
+        self,
+        conversation_id: str,
+        content: str,
+        *,
+        parent_id: str | None = None,
+    ) -> ChatMessage:
+        conversation = self.get(conversation_id)
+        resolved_parent_id = conversation.current_message_id if parent_id is None else parent_id
+        if resolved_parent_id and not conversation.contains_message(resolved_parent_id):
+            raise KeyError(f"Message not found: {resolved_parent_id}")
         now = _now()
-        conversation.messages.append(ChatMessage("user", content, created_at=now))
+        message = ChatMessage(
+            "user",
+            content,
+            created_at=now,
+            id=uuid4().hex,
+            parent_id=resolved_parent_id or "",
+        )
+        conversation.messages.append(message)
+        conversation.current_message_id = message.id
         if conversation.title == "新对话":
             conversation.title = content.strip()[:32] or "新对话"
         conversation.updated_at = now
         self.save()
-        return conversation
+        return message
 
     def append_assistant_message(
         self,
@@ -177,20 +255,26 @@ class ChatStore:
         *,
         content: str,
         events: list[str],
-    ) -> Conversation:
+        parent_id: str | None = None,
+    ) -> ChatMessage:
         conversation = self.get(conversation_id)
+        resolved_parent_id = conversation.current_message_id if parent_id is None else parent_id
+        if resolved_parent_id and not conversation.contains_message(resolved_parent_id):
+            raise KeyError(f"Message not found: {resolved_parent_id}")
         now = _now()
-        conversation.messages.append(
-            ChatMessage(
-                "assistant",
-                content,
-                events=events,
-                created_at=now,
-            )
+        message = ChatMessage(
+            "assistant",
+            content,
+            events=events,
+            created_at=now,
+            id=uuid4().hex,
+            parent_id=resolved_parent_id or "",
         )
+        conversation.messages.append(message)
+        conversation.current_message_id = message.id
         conversation.updated_at = now
         self.save()
-        return conversation
+        return message
 
     def append_pair(
         self,
@@ -200,12 +284,14 @@ class ChatStore:
         assistant_message: str,
         events: list[str],
     ) -> Conversation:
-        self.append_user_message(conversation_id, user_message)
-        return self.append_assistant_message(
+        user = self.append_user_message(conversation_id, user_message)
+        self.append_assistant_message(
             conversation_id,
             content=assistant_message,
             events=events,
+            parent_id=user.id,
         )
+        return self.get(conversation_id)
 
     def save(self) -> None:
         data = {
@@ -266,17 +352,7 @@ class ChatApp:
                 for memory in self.memory_store.list_projects()
             ]
             conversations = [
-                {
-                    "id": conversation.id,
-                    "project_id": conversation.project_id,
-                    "title": conversation.title,
-                    "messages": [
-                        message.to_data()
-                        for message in conversation.messages
-                    ],
-                    "updated_at": conversation.updated_at,
-                    "pinned": conversation.pinned,
-                }
+                self._conversation_payload(conversation)
                 for conversation in self.chat_store.list_conversations()
             ]
             running = {
@@ -323,36 +399,27 @@ class ChatApp:
     def create_conversation(self, project_id: str, title: str = "新对话") -> dict[str, object]:
         self._workspace_for_project(project_id)
         conversation = self.chat_store.create_conversation(project_id, title)
-        return {
-            "id": conversation.id,
-            "project_id": conversation.project_id,
-            "title": conversation.title,
-            "messages": [],
-            "updated_at": conversation.updated_at,
-            "pinned": conversation.pinned,
-        }
+        return self._conversation_payload(conversation)
 
     def rename_conversation(self, conversation_id: str, title: str) -> dict[str, object]:
         conversation = self.chat_store.rename_conversation(conversation_id, title)
-        return {
-            "id": conversation.id,
-            "project_id": conversation.project_id,
-            "title": conversation.title,
-            "messages": [message.to_data() for message in conversation.messages],
-            "updated_at": conversation.updated_at,
-            "pinned": conversation.pinned,
-        }
+        return self._conversation_payload(conversation)
 
     def pin_conversation(self, conversation_id: str, pinned: bool) -> dict[str, object]:
         conversation = self.chat_store.pin_conversation(conversation_id, pinned)
-        return {
-            "id": conversation.id,
-            "project_id": conversation.project_id,
-            "title": conversation.title,
-            "messages": [message.to_data() for message in conversation.messages],
-            "updated_at": conversation.updated_at,
-            "pinned": conversation.pinned,
-        }
+        return self._conversation_payload(conversation)
+
+    def checkout_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+    ) -> dict[str, object]:
+        with self._lock:
+            if conversation_id in self._running_conversations:
+                raise RuntimeError("Cannot switch tree nodes while a conversation is running")
+            conversation = self.chat_store.checkout_message(conversation_id, message_id)
+            self._agents.pop(conversation_id, None)
+            return self._conversation_payload(conversation)
 
     def delete_conversation(self, conversation_id: str) -> dict[str, object]:
         with self._lock:
@@ -367,8 +434,11 @@ class ChatApp:
         workspace_path = self._workspace_for_project(conversation.project_id)
         workspace = Workspace(Path(workspace_path))
         events: list[str] = []
-        self.chat_store.append_user_message(conversation.id, content)
-        self._running_conversations[conversation.id] = RunningConversation(started_at=_now())
+        user_message = self.chat_store.append_user_message(conversation.id, content)
+        self._running_conversations[conversation.id] = RunningConversation(
+            started_at=_now(),
+            user_message_id=user_message.id,
+        )
 
         def on_event(event: str) -> None:
             events.append(event)
@@ -388,25 +458,25 @@ class ChatApp:
             answer = f"任务失败: {error}"
         finally:
             self._running_conversations.pop(conversation.id, None)
-        saved = self.chat_store.append_assistant_message(
+        self.chat_store.append_assistant_message(
             conversation.id,
             content=answer,
             events=events,
+            parent_id=user_message.id,
         )
+        saved = self.chat_store.get(conversation.id)
         return {
-            "conversation": {
-                "id": saved.id,
-                "project_id": saved.project_id,
-                "title": saved.title,
-                "messages": [message.to_data() for message in saved.messages],
-                "updated_at": saved.updated_at,
-                "pinned": saved.pinned,
-            },
+            "conversation": self._conversation_payload(saved),
             "answer": answer,
             "events": events,
         }
 
-    def start_message(self, conversation_id: str, content: str) -> dict[str, object]:
+    def start_message(
+        self,
+        conversation_id: str,
+        content: str,
+        parent_message_id: str = "",
+    ) -> dict[str, object]:
         message = content.strip()
         if not message:
             raise ValueError("Message cannot be empty")
@@ -415,23 +485,24 @@ class ChatApp:
                 raise RuntimeError("Conversation is already running")
             conversation = self.chat_store.get(conversation_id)
             workspace_path = self._workspace_for_project(conversation.project_id)
-            saved = self.chat_store.append_user_message(conversation.id, message)
-            running = RunningConversation(started_at=_now())
+            user_message = self.chat_store.append_user_message(
+                conversation.id,
+                message,
+                parent_id=parent_message_id or None,
+            )
+            saved = self.chat_store.get(conversation.id)
+            running = RunningConversation(
+                started_at=_now(),
+                user_message_id=user_message.id,
+            )
             self._running_conversations[conversation.id] = running
             payload = {
-                "conversation": {
-                    "id": saved.id,
-                    "project_id": saved.project_id,
-                    "title": saved.title,
-                    "messages": [item.to_data() for item in saved.messages],
-                    "updated_at": saved.updated_at,
-                    "pinned": saved.pinned,
-                },
+                "conversation": self._conversation_payload(saved),
                 "running": running.to_data(),
             }
         thread = Thread(
             target=self._run_message_worker,
-            args=(conversation_id, workspace_path, message),
+            args=(conversation_id, workspace_path, message, user_message.id),
             daemon=True,
         )
         thread.start()
@@ -442,6 +513,7 @@ class ChatApp:
         conversation_id: str,
         workspace_path: str,
         content: str,
+        user_message_id: str,
     ) -> None:
         def record_event(event: str) -> None:
             with self._lock:
@@ -475,6 +547,7 @@ class ChatApp:
                     conversation_id,
                     content=answer,
                     events=events,
+                    parent_id=user_message_id,
                 )
                 self._running_conversations.pop(conversation_id, None)
 
@@ -502,6 +575,25 @@ class ChatApp:
             if memory.project_id == project_id:
                 return memory.workspace
         raise KeyError(f"Project not found: {project_id}")
+
+    @staticmethod
+    def _conversation_payload(conversation: Conversation) -> dict[str, object]:
+        return {
+            "id": conversation.id,
+            "project_id": conversation.project_id,
+            "title": conversation.title,
+            "messages": [
+                message.to_data()
+                for message in conversation.current_messages()
+            ],
+            "message_tree": [
+                message.to_data()
+                for message in conversation.messages
+            ],
+            "current_message_id": conversation.current_message_id,
+            "updated_at": conversation.updated_at,
+            "pinned": conversation.pinned,
+        }
 
 
 def make_handler(app: ChatApp) -> type[BaseHTTPRequestHandler]:
@@ -548,10 +640,16 @@ def make_handler(app: ChatApp) -> type[BaseHTTPRequestHandler]:
                     result = app.delete_conversation(
                         str(payload.get("conversation_id", "")),
                     )
+                elif parsed.path == "/api/conversations/checkout":
+                    result = app.checkout_message(
+                        str(payload.get("conversation_id", "")),
+                        str(payload.get("message_id", "")),
+                    )
                 elif parsed.path == "/api/messages":
                     result = app.start_message(
                         str(payload.get("conversation_id", "")),
                         str(payload.get("content", "")),
+                        str(payload.get("parent_message_id", "")),
                     )
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
@@ -889,7 +987,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .conversation-body {
       display: grid;
-      grid-template-columns: 84px minmax(0, 1fr);
+      grid-template-columns: 180px minmax(0, 1fr);
       min-height: 0;
     }
     .day-nav {
@@ -918,6 +1016,48 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
       padding: 8px 0;
       text-align: center;
+    }
+    .nav-group-title {
+      color: var(--muted);
+      font-size: 11px;
+      margin: 10px 0 6px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .session-tree {
+      display: grid;
+      gap: 3px;
+    }
+    .tree-node {
+      width: 100%;
+      border: 0;
+      border-left: 2px solid var(--line);
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 6px 4px 6px 8px;
+      text-align: left;
+      font-size: 12px;
+      line-height: 1.3;
+    }
+    .tree-node.on-path {
+      color: var(--text);
+      border-left-color: #c7d7d4;
+    }
+    .tree-node.active {
+      color: var(--accent-strong);
+      border-left-color: var(--accent);
+      background: #edf7f5;
+    }
+    .tree-label {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .branch-count {
+      color: var(--accent-strong);
+      font-size: 11px;
     }
     .day-separator {
       max-width: 900px;
@@ -1173,7 +1313,7 @@ INDEX_HTML = r"""<!doctype html>
         });
       }
       const days = daysForMessages(messages);
-      $("dayNav").innerHTML = renderDayNav(days);
+      $("dayNav").innerHTML = renderSideNav(days, conversation);
       $("messages").innerHTML = renderConversationMessages(messages);
       $("messages").scrollTop = $("messages").scrollHeight;
       resizeComposer();
@@ -1395,6 +1535,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     $("dayNav").onclick = (event) => {
+      const nodeButton = event.target.closest("button[data-message-checkout]");
+      if (nodeButton) {
+        checkoutMessage(nodeButton.dataset.messageCheckout);
+        return;
+      }
       const button = event.target.closest("button[data-day]");
       if (!button) return;
       const target = document.getElementById(dayElementId(button.dataset.day));
@@ -1416,6 +1561,7 @@ INDEX_HTML = r"""<!doctype html>
           body: JSON.stringify({
             conversation_id: state.conversationId,
             content,
+            parent_message_id: currentConversation()?.current_message_id || "",
           }),
         });
         const updated = result.conversation;
@@ -1448,14 +1594,36 @@ INDEX_HTML = r"""<!doctype html>
       const conversation = state.conversations.find((item) => item.id === conversationId);
       if (!conversation) return;
       const now = new Date().toISOString();
+      const parentId = conversation.current_message_id || "";
+      const userId = `pending-user-${Date.now()}`;
+      const assistantId = `pending-assistant-${Date.now()}`;
+      const previousMessages = conversation.messages || [];
+      const previousTree = conversation.message_tree || previousMessages;
       pendingStarted[conversationId] = now;
+      const userMessage = { id: userId, parent_id: parentId, role: "user", content, created_at: now, events: [] };
+      const assistantMessage = {
+        id: assistantId,
+        parent_id: userId,
+        role: "assistant",
+        content: "正在思考",
+        created_at: now,
+        events: [],
+        pending: true,
+        started_at: now,
+      };
       conversation.messages = [
-        ...(conversation.messages || []),
-        { role: "user", content, created_at: now, events: [] },
-        { role: "assistant", content: "正在思考", created_at: now, events: [], pending: true, started_at: now },
+        ...previousMessages,
+        userMessage,
+        assistantMessage,
       ];
+      conversation.message_tree = [
+        ...previousTree,
+        userMessage,
+        assistantMessage,
+      ];
+      conversation.current_message_id = userId;
       if (conversation.title === "新对话") conversation.title = content.slice(0, 32) || "新对话";
-      state.running[conversationId] = { started_at: now, events: [] };
+      state.running[conversationId] = { started_at: now, user_message_id: userId, events: [] };
     }
 
     function markOptimisticFailure(conversationId, reason) {
@@ -1469,6 +1637,19 @@ INDEX_HTML = r"""<!doctype html>
         events: [],
       });
       delete state.running[conversationId];
+    }
+
+    async function checkoutMessage(messageId) {
+      const conversation = currentConversation();
+      if (!conversation || !messageId || runningFor(conversation.id)) return;
+      const updated = await api("/api/conversations/checkout", {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: conversation.id, message_id: messageId }),
+      });
+      updateConversation(updated);
+      state.projectId = updated.project_id;
+      state.conversationId = updated.id;
+      render();
     }
 
     function lastRole(messages) {
@@ -1536,11 +1717,70 @@ INDEX_HTML = r"""<!doctype html>
       return days;
     }
 
+    function renderSideNav(days, conversation) {
+      return [
+        `<div class="nav-group-title">日期</div>`,
+        renderDayNav(days),
+        `<div class="nav-group-title">Session 树</div>`,
+        renderSessionTree(conversation),
+      ].join("");
+    }
+
     function renderDayNav(days) {
       if (!days.length) return `<div class="day-empty">暂无消息</div>`;
       return days.map((day) => (
         `<button class="day-link" data-day="${escapeHtml(day)}" title="${escapeHtml(dayLabel(day))}">${escapeHtml(shortDayLabel(day))}</button>`
       )).join("");
+    }
+
+    function renderSessionTree(conversation) {
+      if (!conversation) return `<div class="day-empty">暂无节点</div>`;
+      const nodes = conversation.message_tree || conversation.messages || [];
+      if (!nodes.length) return `<div class="day-empty">暂无节点</div>`;
+      const activeId = conversation.current_message_id || (conversation.messages.at(-1)?.id || "");
+      const pathIds = new Set((conversation.messages || []).map((message) => message.id).filter(Boolean));
+      const childCount = {};
+      for (const node of nodes) {
+        const parentId = node.parent_id || "";
+        childCount[parentId] = (childCount[parentId] || 0) + 1;
+      }
+      const depths = messageDepths(nodes);
+      return `<div class="session-tree">${
+        nodes.map((message) => {
+          const id = message.id || "";
+          const active = id && id === activeId ? " active" : "";
+          const onPath = pathIds.has(id) ? " on-path" : "";
+          const depth = Math.min(depths[id] || 0, 6);
+          const children = childCount[id] || 0;
+          const branch = children > 1 ? ` <span class="branch-count">分叉 ${children}</span>` : "";
+          const label = `${message.role === "user" ? "你" : "Agent"}：${messagePreview(message.content || "")}`;
+          return `<button class="tree-node${active}${onPath}" data-message-checkout="${escapeHtml(id)}" style="padding-left:${8 + depth * 12}px" title="${escapeHtml(label)}"><span class="tree-label">${escapeHtml(label)}${branch}</span></button>`;
+        }).join("")
+      }</div>`;
+    }
+
+    function messageDepths(nodes) {
+      const byId = {};
+      for (const node of nodes) {
+        if (node.id) byId[node.id] = node;
+      }
+      const cache = {};
+      function depthOf(id, seen = new Set()) {
+        if (!id || !byId[id] || seen.has(id)) return 0;
+        if (cache[id] !== undefined) return cache[id];
+        seen.add(id);
+        const parentId = byId[id].parent_id || "";
+        cache[id] = parentId && byId[parentId] ? depthOf(parentId, seen) + 1 : 0;
+        return cache[id];
+      }
+      for (const node of nodes) {
+        if (node.id) depthOf(node.id);
+      }
+      return cache;
+    }
+
+    function messagePreview(content) {
+      return String(content).replace(/\s+/g, " ").trim().slice(0, 42) || "空消息";
     }
 
     function dayKey(message) {
