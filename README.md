@@ -1,5 +1,5 @@
 # coding-agent-from-scratch
-A lightweight coding agent built from scratch with native LLM tool calling, local tool execution, context management, and a custom agent loop.
+A lightweight coding agent built from scratch with native LLM tool calling, local tool execution, extension hooks, project memory, skills, and a custom agent loop.
 
 ## Usage
 
@@ -21,7 +21,7 @@ Project memory and chat history are saved under `.coding-agent/` in the director
 
 ## Skills
 
-The agent has a lightweight built-in skill registry. Skills live as Markdown files under `src/coding_agent/skills/builtin/`, and the registry deterministically selects up to two relevant skills for each task based on trigger phrases. Selected skills are injected as task-specific system messages, recorded in the trace, and shown in live chat events.
+The agent has a lightweight built-in skill registry implemented as an extension. Skills live as Markdown files under `src/coding_agent/skills/builtin/`, and the registry deterministically selects up to two relevant skills for each task based on trigger phrases. Selected skills are injected as task-specific system messages, recorded in the trace, and shown in live chat events.
 
 Built-in skills:
 
@@ -30,3 +30,7 @@ Built-in skills:
 - `desktop-python`: keep Python desktop apps testable and cover UI callbacks where possible.
 - `web-ui`: handle immediate UI feedback, progress states, errors, and request/rendering paths.
 - `project-summary`: explain the live project using memory as orientation, not as a substitute for inspection.
+
+## Extensions
+
+The agent exposes lifecycle hooks in `src/coding_agent/extensions.py` so new framework behavior can be added without editing the core loop. Extensions can inject context, add tool definitions, observe LLM calls, intercept or implement tool calls, and save state at session end. Project memory and skill selection are now ordinary extensions.

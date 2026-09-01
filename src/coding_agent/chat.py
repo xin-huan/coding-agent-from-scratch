@@ -270,8 +270,12 @@ class ChatApp:
                     "id": conversation.id,
                     "project_id": conversation.project_id,
                     "title": conversation.title,
-                    "messages": [message.to_data() for message in conversation.messages],
+                    "messages": [
+                        message.to_data()
+                        for message in conversation.messages
+                    ],
                     "updated_at": conversation.updated_at,
+                    "pinned": conversation.pinned,
                 }
                 for conversation in self.chat_store.list_conversations()
             ]
@@ -325,6 +329,7 @@ class ChatApp:
             "title": conversation.title,
             "messages": [],
             "updated_at": conversation.updated_at,
+            "pinned": conversation.pinned,
         }
 
     def rename_conversation(self, conversation_id: str, title: str) -> dict[str, object]:
@@ -335,7 +340,27 @@ class ChatApp:
             "title": conversation.title,
             "messages": [message.to_data() for message in conversation.messages],
             "updated_at": conversation.updated_at,
+            "pinned": conversation.pinned,
         }
+
+    def pin_conversation(self, conversation_id: str, pinned: bool) -> dict[str, object]:
+        conversation = self.chat_store.pin_conversation(conversation_id, pinned)
+        return {
+            "id": conversation.id,
+            "project_id": conversation.project_id,
+            "title": conversation.title,
+            "messages": [message.to_data() for message in conversation.messages],
+            "updated_at": conversation.updated_at,
+            "pinned": conversation.pinned,
+        }
+
+    def delete_conversation(self, conversation_id: str) -> dict[str, object]:
+        with self._lock:
+            if conversation_id in self._running_conversations:
+                raise RuntimeError("Cannot delete a running conversation")
+            self.chat_store.delete_conversation(conversation_id)
+            self._agents.pop(conversation_id, None)
+        return {"deleted": conversation_id}
 
     def send_message(self, conversation_id: str, content: str) -> dict[str, object]:
         conversation = self.chat_store.get(conversation_id)
@@ -375,6 +400,7 @@ class ChatApp:
                 "title": saved.title,
                 "messages": [message.to_data() for message in saved.messages],
                 "updated_at": saved.updated_at,
+                "pinned": saved.pinned,
             },
             "answer": answer,
             "events": events,
@@ -399,6 +425,7 @@ class ChatApp:
                     "title": saved.title,
                     "messages": [item.to_data() for item in saved.messages],
                     "updated_at": saved.updated_at,
+                    "pinned": saved.pinned,
                 },
                 "running": running.to_data(),
             }
@@ -511,6 +538,15 @@ def make_handler(app: ChatApp) -> type[BaseHTTPRequestHandler]:
                     result = app.rename_conversation(
                         str(payload.get("conversation_id", "")),
                         str(payload.get("title", "")),
+                    )
+                elif parsed.path == "/api/conversations/pin":
+                    result = app.pin_conversation(
+                        str(payload.get("conversation_id", "")),
+                        bool(payload.get("pinned", False)),
+                    )
+                elif parsed.path == "/api/conversations/delete":
+                    result = app.delete_conversation(
+                        str(payload.get("conversation_id", "")),
                     )
                 elif parsed.path == "/api/messages":
                     result = app.start_message(
@@ -705,9 +741,20 @@ INDEX_HTML = r"""<!doctype html>
     .row input, .row select { min-width: 0; }
     .project-actions {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 8px;
       margin-bottom: 12px;
+    }
+    .current-project {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      background: #fff;
     }
     .lists {
       min-height: 0;
@@ -721,9 +768,71 @@ INDEX_HTML = r"""<!doctype html>
       text-transform: uppercase;
       letter-spacing: .04em;
     }
+    .project-group {
+      margin-bottom: 8px;
+    }
+    .project-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto auto;
+      gap: 6px;
+      align-items: center;
+      width: 100%;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text);
+      padding: 8px 6px;
+    }
+    .project-row.active {
+      background: #edf7f5;
+      border-color: #b8dcd7;
+    }
+    .project-toggle,
+    .project-name {
+      border: 0;
+      background: transparent;
+      color: inherit;
+      padding: 0;
+      text-align: left;
+    }
+    .project-toggle {
+      width: 20px;
+      text-align: center;
+    }
+    .project-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .project-action,
+    .conversation-action {
+      width: 30px;
+      height: 30px;
+      border-color: transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 0;
+      text-align: center;
+    }
+    .project-action:hover,
+    .conversation-action:hover {
+      border-color: var(--line);
+      color: var(--accent-strong);
+      background: #fff;
+    }
+    .conversation-action.danger:hover {
+      color: #b42318;
+    }
+    .conversation-list {
+      margin: 2px 0 10px 24px;
+    }
+    .empty-project {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 6px 8px;
+    }
     .item-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 6px;
       align-items: center;
       margin-bottom: 4px;
@@ -739,11 +848,10 @@ INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .item.rename {
-      width: 38px;
-      text-align: center;
-      padding-left: 0;
-      padding-right: 0;
+    .item.pinned::before {
+      content: "置顶 ";
+      color: var(--accent-strong);
+      font-size: 12px;
     }
     .item.active {
       background: #edf7f5;
@@ -778,6 +886,46 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 0;
       overflow: auto;
       padding: 20px;
+    }
+    .conversation-body {
+      display: grid;
+      grid-template-columns: 84px minmax(0, 1fr);
+      min-height: 0;
+    }
+    .day-nav {
+      border-right: 1px solid var(--line);
+      background: #fbfcfc;
+      overflow: auto;
+      padding: 18px 8px;
+    }
+    .day-link {
+      width: 100%;
+      border: 0;
+      border-left: 2px solid var(--line);
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 7px 0 7px 8px;
+      text-align: left;
+      font-size: 12px;
+    }
+    .day-link:hover {
+      color: var(--accent-strong);
+      border-left-color: var(--accent);
+    }
+    .day-empty {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 8px 0;
+      text-align: center;
+    }
+    .day-separator {
+      max-width: 900px;
+      margin: 6px 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
     }
     .message {
       max-width: 900px;
@@ -863,6 +1011,22 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 13px;
       white-space: pre-wrap;
     }
+    .events-details {
+      margin-top: 10px;
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .events-details summary {
+      cursor: pointer;
+      user-select: none;
+    }
+    .events-details .events {
+      border-top: 0;
+      margin-top: 8px;
+      padding-top: 0;
+    }
     .composer {
       background: var(--panel);
       border-top: 1px solid var(--line);
@@ -891,6 +1055,8 @@ INDEX_HTML = r"""<!doctype html>
       }
       body { overflow: auto; }
       main { height: 58vh; }
+      .conversation-body { grid-template-columns: 1fr; }
+      .day-nav { display: none; }
     }
   </style>
 </head>
@@ -905,16 +1071,15 @@ INDEX_HTML = r"""<!doctype html>
           <button id="browseProject" class="secondary">浏览</button>
           <button id="addProject">添加</button>
         </div>
-        <label for="projectSelect">当前项目</label>
+        <label>当前项目</label>
         <div class="project-actions">
-          <select id="projectSelect"></select>
-          <button id="renameProject" class="secondary">改名</button>
+          <div class="current-project" id="currentProjectLabel">未选择项目</div>
           <button id="newConversation" class="secondary">新对话</button>
         </div>
       </div>
       <div class="lists">
-        <div class="section-title">对话</div>
-        <div id="conversationList"></div>
+        <div class="section-title">项目与对话</div>
+        <div id="projectTree"></div>
       </div>
     </aside>
     <main>
@@ -922,7 +1087,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="title" id="conversationTitle">未选择对话</div>
         <div class="subtitle" id="projectSubtitle">请选择或添加一个项目</div>
       </header>
-      <div class="messages" id="messages"></div>
+      <div class="conversation-body">
+        <nav class="day-nav" id="dayNav" aria-label="聊天日期目录"></nav>
+        <div class="messages" id="messages"></div>
+      </div>
       <form class="composer" id="composer">
         <textarea id="messageInput" placeholder="输入你的需求"></textarea>
         <button id="sendButton" type="submit">发送</button>
@@ -939,6 +1107,7 @@ INDEX_HTML = r"""<!doctype html>
     };
     const $ = (id) => document.getElementById(id);
     const pendingStarted = {};
+    const expandedProjects = new Set();
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
@@ -955,16 +1124,23 @@ INDEX_HTML = r"""<!doctype html>
       state.projects = data.projects || [];
       state.conversations = data.conversations || [];
       state.running = data.running_conversations || {};
-      if (!state.projectId && state.projects[0]) state.projectId = state.projects[0].id;
-      const projectConversations = conversationsForProject();
-      if (!state.conversationId && projectConversations[0]) {
-        state.conversationId = projectConversations[0].id;
-      }
+      state.projects.forEach((project) => expandedProjects.add(project.id));
+      reconcileSelection();
       render();
     }
 
-    function conversationsForProject() {
-      return state.conversations.filter((item) => item.project_id === state.projectId);
+    function reconcileSelection() {
+      if (!state.projects.some((project) => project.id === state.projectId)) {
+        state.projectId = state.projects[0] ? state.projects[0].id : "";
+      }
+      const projectConversations = conversationsForProject(state.projectId);
+      if (!projectConversations.some((conversation) => conversation.id === state.conversationId)) {
+        state.conversationId = projectConversations[0] ? projectConversations[0].id : "";
+      }
+    }
+
+    function conversationsForProject(projectId = state.projectId) {
+      return state.conversations.filter((item) => item.project_id === projectId);
     }
 
     function currentProject() {
@@ -976,28 +1152,14 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function render() {
-      $("projectSelect").innerHTML = state.projects.map((project) => {
-        const selected = project.id === state.projectId ? "selected" : "";
-        const label = project.display_name || project.workspace;
-        return `<option value="${project.id}" ${selected}>${escapeHtml(label)}</option>`;
-      }).join("");
-
-      $("conversationList").innerHTML = conversationsForProject().map((conversation) => {
-        const active = conversation.id === state.conversationId ? " active" : "";
-        return `
-          <div class="item-row">
-            <button class="item${active}" data-id="${conversation.id}">${escapeHtml(conversation.title)}</button>
-            <button class="item rename" data-rename-id="${conversation.id}" title="重命名对话">改</button>
-          </div>`;
-      }).join("");
-
       const project = currentProject();
       const conversation = currentConversation();
       const running = conversation ? runningFor(conversation.id) : null;
+      $("projectTree").innerHTML = renderProjectTree();
+      $("currentProjectLabel").textContent = project ? projectLabel(project) : "未选择项目";
       $("conversationTitle").textContent = conversation ? conversation.title : "未选择对话";
       $("projectSubtitle").textContent = project ? project.workspace : "请选择或添加一个项目";
       $("sendButton").disabled = !conversation || Boolean(running);
-      $("renameProject").disabled = !project;
       $("newConversation").disabled = !project;
 
       let messages = conversation ? [...conversation.messages] : [];
@@ -1010,19 +1172,55 @@ INDEX_HTML = r"""<!doctype html>
           events: running.events || [],
         });
       }
-      $("messages").innerHTML = messages.map((message) => {
-        const events = message.events && message.events.length
-          ? `<div class="events">${escapeHtml(message.events.join("\n"))}</div>`
-          : "";
-        const pending = message.pending ? " pending" : "";
-        const elapsed = message.pending
-          ? `<div class="elapsed">已处理 ${elapsedSeconds(message.started_at)} 秒</div>`
-          : "";
-        const content = renderMessageContent(message);
-        return `<div class="message ${message.role}${pending}">${elapsed}<div class="message-content">${content}</div>${events}</div>`;
-      }).join("");
+      const days = daysForMessages(messages);
+      $("dayNav").innerHTML = renderDayNav(days);
+      $("messages").innerHTML = renderConversationMessages(messages);
       $("messages").scrollTop = $("messages").scrollHeight;
       resizeComposer();
+    }
+
+    function renderProjectTree() {
+      if (!state.projects.length) {
+        return `<div class="empty-project">还没有项目</div>`;
+      }
+      return state.projects.map((project) => {
+        const expanded = expandedProjects.has(project.id);
+        const active = project.id === state.projectId ? " active" : "";
+        const conversations = conversationsForProject(project.id);
+        const conversationList = expanded
+          ? `<div class="conversation-list">${
+              conversations.length
+                ? conversations.map(renderConversationRow).join("")
+                : `<div class="empty-project">暂无对话</div>`
+            }</div>`
+          : "";
+        return `
+          <div class="project-group">
+            <div class="project-row${active}">
+              <button class="project-toggle" data-toggle-project="${project.id}" title="${expanded ? "收起项目" : "展开项目"}">${expanded ? "v" : ">"}</button>
+              <button class="project-name" data-project-id="${project.id}" title="${escapeHtml(project.workspace)}">${escapeHtml(projectLabel(project))}</button>
+              <button class="project-action" data-project-rename-id="${project.id}" title="重命名项目">改</button>
+              <button class="project-action" data-project-new-id="${project.id}" title="新建对话">+</button>
+            </div>
+            ${conversationList}
+          </div>`;
+      }).join("");
+    }
+
+    function renderConversationRow(conversation) {
+      const active = conversation.id === state.conversationId ? " active" : "";
+      const pinned = conversation.pinned ? " pinned" : "";
+      return `
+        <div class="item-row">
+          <button class="item${active}${pinned}" data-conversation-id="${conversation.id}" title="${escapeHtml(conversation.title)}">${escapeHtml(conversation.title)}</button>
+          <button class="conversation-action" data-pin-id="${conversation.id}" title="${conversation.pinned ? "取消置顶" : "置顶"}">${conversation.pinned ? "下" : "顶"}</button>
+          <button class="conversation-action" data-rename-id="${conversation.id}" title="重命名对话">改</button>
+          <button class="conversation-action danger" data-delete-id="${conversation.id}" title="删除对话">删</button>
+        </div>`;
+    }
+
+    function projectLabel(project) {
+      return project.display_name || project.workspace.split(/[\\/]/).pop() || project.workspace;
     }
 
     $("browseProject").onclick = async () => {
@@ -1047,10 +1245,90 @@ INDEX_HTML = r"""<!doctype html>
       await loadState();
     };
 
-    $("renameProject").onclick = async () => {
-      const project = currentProject();
+    $("newConversation").onclick = async () => {
+      await createConversationForProject(state.projectId);
+    };
+
+    $("projectTree").onclick = async (event) => {
+      const toggle = event.target.closest("button[data-toggle-project]");
+      if (toggle) {
+        const projectId = toggle.dataset.toggleProject;
+        if (expandedProjects.has(projectId)) expandedProjects.delete(projectId);
+        else expandedProjects.add(projectId);
+        selectProject(projectId);
+        return;
+      }
+
+      const projectButton = event.target.closest("button[data-project-id]");
+      if (projectButton) {
+        selectProject(projectButton.dataset.projectId);
+        return;
+      }
+
+      const projectRename = event.target.closest("button[data-project-rename-id]");
+      if (projectRename) {
+        await renameProject(projectRename.dataset.projectRenameId);
+        return;
+      }
+
+      const projectNew = event.target.closest("button[data-project-new-id]");
+      if (projectNew) {
+        await createConversationForProject(projectNew.dataset.projectNewId);
+        return;
+      }
+
+      const pinButton = event.target.closest("button[data-pin-id]");
+      if (pinButton) {
+        await togglePinConversation(pinButton.dataset.pinId);
+        return;
+      }
+
+      const renameButton = event.target.closest("button[data-rename-id]");
+      if (renameButton) {
+        await renameConversation(renameButton.dataset.renameId);
+        return;
+      }
+
+      const deleteButton = event.target.closest("button[data-delete-id]");
+      if (deleteButton) {
+        await deleteConversation(deleteButton.dataset.deleteId);
+        return;
+      }
+
+      const conversationButton = event.target.closest("button[data-conversation-id]");
+      if (!conversationButton) return;
+      const conversation = state.conversations.find((item) => item.id === conversationButton.dataset.conversationId);
+      if (!conversation) return;
+      state.projectId = conversation.project_id;
+      state.conversationId = conversation.id;
+      expandedProjects.add(conversation.project_id);
+      render();
+    };
+
+    function selectProject(projectId) {
+      state.projectId = projectId;
+      expandedProjects.add(projectId);
+      const conversations = conversationsForProject(projectId);
+      state.conversationId = conversations[0] ? conversations[0].id : "";
+      render();
+    }
+
+    async function createConversationForProject(projectId) {
+      if (!projectId) return;
+      const conversation = await api("/api/conversations", {
+        method: "POST",
+        body: JSON.stringify({ project_id: projectId, title: "新对话" }),
+      });
+      state.projectId = projectId;
+      state.conversationId = conversation.id;
+      expandedProjects.add(projectId);
+      await loadState();
+    }
+
+    async function renameProject(projectId) {
+      const project = state.projects.find((item) => item.id === projectId);
       if (!project) return;
-      const current = project.display_name || project.workspace.split(/[\\/]/).pop() || project.workspace;
+      const current = projectLabel(project);
       const name = prompt("项目名称", current);
       if (!name || !name.trim()) return;
       const updated = await api("/api/projects/rename", {
@@ -1059,38 +1337,9 @@ INDEX_HTML = r"""<!doctype html>
       });
       const index = state.projects.findIndex((item) => item.id === updated.id);
       if (index >= 0) state.projects[index] = updated;
+      state.projectId = updated.id;
       render();
-    };
-
-    $("projectSelect").onchange = () => {
-      state.projectId = $("projectSelect").value;
-      state.conversationId = "";
-      const conversations = conversationsForProject();
-      if (conversations[0]) state.conversationId = conversations[0].id;
-      render();
-    };
-
-    $("newConversation").onclick = async () => {
-      if (!state.projectId) return;
-      const conversation = await api("/api/conversations", {
-        method: "POST",
-        body: JSON.stringify({ project_id: state.projectId, title: "新对话" }),
-      });
-      state.conversationId = conversation.id;
-      await loadState();
-    };
-
-    $("conversationList").onclick = (event) => {
-      const renameButton = event.target.closest("button[data-rename-id]");
-      if (renameButton) {
-        renameConversation(renameButton.dataset.renameId);
-        return;
-      }
-      const button = event.target.closest("button[data-id]");
-      if (!button) return;
-      state.conversationId = button.dataset.id;
-      render();
-    };
+    }
 
     async function renameConversation(conversationId) {
       const conversation = state.conversations.find((item) => item.id === conversationId);
@@ -1105,6 +1354,52 @@ INDEX_HTML = r"""<!doctype html>
       if (index >= 0) state.conversations[index] = updated;
       render();
     }
+
+    async function togglePinConversation(conversationId) {
+      const conversation = state.conversations.find((item) => item.id === conversationId);
+      if (!conversation) return;
+      const updated = await api("/api/conversations/pin", {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: conversation.id, pinned: !conversation.pinned }),
+      });
+      updateConversation(updated);
+      state.projectId = updated.project_id;
+      state.conversationId = updated.id;
+      render();
+    }
+
+    async function deleteConversation(conversationId) {
+      const conversation = state.conversations.find((item) => item.id === conversationId);
+      if (!conversation) return;
+      if (!confirm(`删除对话“${conversation.title}”？`)) return;
+      await api("/api/conversations/delete", {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: conversation.id }),
+      });
+      state.conversations = state.conversations.filter((item) => item.id !== conversation.id);
+      if (state.conversationId === conversation.id) {
+        const remaining = conversationsForProject(conversation.project_id);
+        state.conversationId = remaining[0] ? remaining[0].id : "";
+      }
+      render();
+    }
+
+    function updateConversation(updated) {
+      const index = state.conversations.findIndex((item) => item.id === updated.id);
+      if (index >= 0) state.conversations[index] = updated;
+      else state.conversations.unshift(updated);
+      state.conversations.sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+        return String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+      });
+    }
+
+    $("dayNav").onclick = (event) => {
+      const button = event.target.closest("button[data-day]");
+      if (!button) return;
+      const target = document.getElementById(dayElementId(button.dataset.day));
+      if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
+    };
 
     $("composer").onsubmit = async (event) => {
       event.preventDefault();
@@ -1124,9 +1419,7 @@ INDEX_HTML = r"""<!doctype html>
           }),
         });
         const updated = result.conversation;
-        const index = state.conversations.findIndex((item) => item.id === updated.id);
-        if (index >= 0) state.conversations[index] = updated;
-        else state.conversations.unshift(updated);
+        updateConversation(updated);
         state.running[updated.id] = result.running;
       } catch (error) {
         markOptimisticFailure(state.conversationId, error.message);
@@ -1198,6 +1491,77 @@ INDEX_HTML = r"""<!doctype html>
     function renderMessageContent(message) {
       if (message.role === "assistant") return renderMarkdown(message.content || "");
       return escapeHtml(message.content || "").replace(/\n/g, "<br>");
+    }
+
+    function renderConversationMessages(messages) {
+      let currentDay = "";
+      const parts = [];
+      for (const message of messages) {
+        const day = dayKey(message);
+        if (day !== currentDay) {
+          currentDay = day;
+          parts.push(`<div class="day-separator" id="${dayElementId(day)}">${escapeHtml(dayLabel(day))}</div>`);
+        }
+        parts.push(renderMessage(message));
+      }
+      return parts.join("");
+    }
+
+    function renderMessage(message) {
+      const events = renderEvents(message);
+      const pending = message.pending ? " pending" : "";
+      const elapsed = message.pending
+        ? `<div class="elapsed">已处理 ${elapsedSeconds(message.started_at)} 秒</div>`
+        : "";
+      const content = renderMessageContent(message);
+      return `<div class="message ${message.role}${pending}">${elapsed}<div class="message-content">${content}</div>${events}</div>`;
+    }
+
+    function renderEvents(message) {
+      if (!message.events || !message.events.length) return "";
+      const body = `<div class="events">${escapeHtml(message.events.join("\n"))}</div>`;
+      if (message.pending) return body;
+      return `<details class="events-details"><summary>执行过程 ${message.events.length} 条</summary>${body}</details>`;
+    }
+
+    function daysForMessages(messages) {
+      const seen = new Set();
+      const days = [];
+      for (const message of messages) {
+        const day = dayKey(message);
+        if (seen.has(day)) continue;
+        seen.add(day);
+        days.push(day);
+      }
+      return days;
+    }
+
+    function renderDayNav(days) {
+      if (!days.length) return `<div class="day-empty">暂无消息</div>`;
+      return days.map((day) => (
+        `<button class="day-link" data-day="${escapeHtml(day)}" title="${escapeHtml(dayLabel(day))}">${escapeHtml(shortDayLabel(day))}</button>`
+      )).join("");
+    }
+
+    function dayKey(message) {
+      const raw = message.created_at || message.started_at || "";
+      const timestamp = Date.parse(raw);
+      if (Number.isNaN(timestamp)) return "unknown";
+      return new Date(timestamp).toLocaleDateString("sv-SE");
+    }
+
+    function dayLabel(day) {
+      if (day === "unknown") return "未知日期";
+      return day;
+    }
+
+    function shortDayLabel(day) {
+      if (day === "unknown") return "未知";
+      return day.slice(5);
+    }
+
+    function dayElementId(day) {
+      return `day-${String(day).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
     }
 
     function renderMarkdown(markdown) {

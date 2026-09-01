@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -21,14 +21,10 @@ class EvalCaseTests(unittest.TestCase):
         args = _build_parser().parse_args(["--run", "M3"])
 
         self.assertEqual(args.max_steps, 16)
-        self.assertEqual(args.context_mode, "off")
 
-    def test_cli_can_disable_context_management_for_a_baseline(self) -> None:
-        args = _build_parser().parse_args(
-            ["--run", "M4", "--context-mode", "off"]
-        )
-
-        self.assertEqual(args.context_mode, "off")
+    def test_cli_no_longer_exposes_context_manager_modes(self) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            _build_parser().parse_args(["--run", "M4", "--context-mode", "v3"])
 
     def test_cli_lists_cases_without_running_a_model(self) -> None:
         output = StringIO()
@@ -139,7 +135,6 @@ raise SystemExit(0 if (workspace / "answer.txt").read_text() == "done\\n" else 1
                     '{"event":"model_request"}\n'
                     '{"event":"tool_start"}\n'
                     '{"event":"token_usage","data":{"prompt_tokens":120,"completion_tokens":30,"cache_hit_tokens":40}}\n'
-                    '{"event":"context_built","data":{"original_characters":10000,"sent_characters":4000}}\n'
                     '{"event":"task_complete"}\n',
                     encoding="utf-8",
                 )
@@ -156,7 +151,6 @@ raise SystemExit(0 if (workspace / "answer.txt").read_text() == "done\\n" else 1
             self.assertEqual(result.prompt_tokens, 120)
             self.assertEqual(result.completion_tokens, 30)
             self.assertEqual(result.cache_hit_tokens, 40)
-            self.assertEqual(result.context_saved_percent, 60.0)
             saved = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["case_id"], "T1")
             self.assertIn("answer.txt", (run_dir / "changes.patch").read_text())
@@ -732,13 +726,6 @@ notes_app/validation.py 和 project_tests。"""
                 prompt_tokens=1_000,
                 completion_tokens=200,
                 cache_hit_tokens=300,
-                context_original_characters=10_000,
-                context_sent_characters=4_000,
-                context_original_tokens=3_000,
-                context_sent_tokens=1_200,
-                retrieved_entries=2,
-                read_cache_hits=1,
-                context_mode="v2",
             ),
             EvalResult(
                 "B1",
@@ -766,11 +753,10 @@ notes_app/validation.py 和 project_tests。"""
         self.assertIn("| bugfix | 1 | 0 | 0.0% |", report)
         self.assertIn("Prompt tokens: 1000", report)
         self.assertIn("Completion tokens: 200", report)
-        self.assertIn("60.0% saved", report)
-        self.assertIn("Estimated context tokens sent: 1200/3000", report)
-        self.assertIn("Retrieved history entries: 2", report)
-        self.assertIn("Unchanged read cache hits: 1", report)
-        self.assertIn("| C1 | v2 |", report)
+        self.assertNotIn("Estimated context tokens sent", report)
+        self.assertNotIn("Retrieved history entries", report)
+        self.assertNotIn("Unchanged read cache hits", report)
+        self.assertIn("| C1 | create | PASS |", report)
         self.assertIn('"case_id": "B1"', failures)
         self.assertNotIn('"case_id": "C1"', failures)
 

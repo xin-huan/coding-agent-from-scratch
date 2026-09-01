@@ -6,7 +6,7 @@ from pathlib import Path
 
 from coding_agent.agent import Agent, ModelReply, TaskState, TokenUsage, ToolCall
 from coding_agent.checkpoint import CheckpointStore
-from coding_agent.context import ContextManager
+from coding_agent.extensions import BaseExtension, ToolResult
 from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
@@ -39,6 +39,78 @@ class InterruptingCheckpointStore(CheckpointStore):
         self.save_count += 1
         if self.save_count == 1:
             raise KeyboardInterrupt
+
+
+class RecordingExtension(BaseExtension):
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def on_session_start(self, context) -> None:
+        self.events.append(f"start:{context.task}")
+
+    def inject_context(self, context) -> list[dict[str, object]]:
+        return [
+            {
+                "role": "system",
+                "content": "<extension_context>project note: beta</extension_context>",
+            }
+        ]
+
+    def before_llm_call(
+        self,
+        context,
+        *,
+        step: int,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        self.events.append(f"before_llm:{step}")
+        return [
+            *messages,
+            {"role": "system", "content": "<extension_marker>before llm</extension_marker>"},
+        ], tools
+
+    def after_llm_call(self, context, *, step: int, reply) -> None:
+        self.events.append(f"after_llm:{step}:{reply.content}")
+
+    def on_session_end(self, context, *, answer, error, state) -> None:
+        self.events.append(f"end:{answer}:{error is None}")
+
+
+class EchoToolExtension(BaseExtension):
+    name = "echo-tool"
+
+    def tool_definitions(self, context) -> list[dict[str, object]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "extension_echo",
+                    "description": "Echo text through an extension-owned tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                },
+            }
+        ]
+
+    def execute_tool(self, context, *, step: int, call) -> ToolResult | None:
+        if call.name != "extension_echo":
+            return None
+        return ToolResult(f"extension echo: {call.arguments['text']}")
+
+
+class BlockingExtension(BaseExtension):
+    name = "blocker"
+
+    def before_tool_call(self, context, *, step: int, call):
+        if call.name == "read_file":
+            return None
+        return call
 
 
 def write_smoke_suite(root: Path, *, passing: bool = True) -> None:
@@ -98,47 +170,6 @@ class AgentTests(unittest.TestCase):
 
             self.assertIn("[Token] 本次输入 100，输出 20；本次会话累计 120", events)
 
-    def test_compacts_long_tool_history_before_later_model_requests(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "large.txt").write_text(
-                "".join(f"line {index:04d}\n" for index in range(3_000)),
-                encoding="utf-8",
-            )
-            events: list[str] = []
-            model = FakeModel(
-                [
-                    ModelReply(
-                        content=None,
-                        tool_calls=(
-                            ToolCall(f"read-{index}", "read_file", {"path": "large.txt"}),
-                        ),
-                    )
-                    for index in range(4)
-                ]
-                + [ModelReply(content="检查完成。")]
-            )
-
-            answer = Agent(
-                model,
-                Workspace(root),
-                context_manager=ContextManager(
-                    max_prompt_tokens=2_000,
-                    recent_turns=1,
-                ),
-                on_event=events.append,
-            ).run("检查大文件")
-
-            self.assertEqual(answer, "检查完成。")
-            final_request = json.dumps(
-                model.received_messages[-1],
-                ensure_ascii=False,
-            )
-            self.assertIn("<retrieved_history>", final_request)
-            self.assertIn("unchanged read cache hit", final_request)
-            self.assertLess(len(final_request), 8_000)
-            self.assertTrue(any(event.startswith("[上下文]") for event in events))
-
     def test_follow_up_task_receives_lightweight_session_context_by_default(
         self,
     ) -> None:
@@ -152,7 +183,7 @@ class AgentTests(unittest.TestCase):
             )
             agent = Agent(model, Workspace(Path(temp_dir)), on_event=events.append)
 
-            self.assertFalse(agent.context_manager.enabled)
+            self.assertFalse(hasattr(agent, "context_manager"))
             self.assertEqual(agent.run("记录：当前项目是番茄钟应用"), "已确认这是番茄钟项目。")
             self.assertEqual(agent.run("为我介绍一下这个项目"), "这个项目是一个番茄钟应用。")
 
@@ -163,6 +194,88 @@ class AgentTests(unittest.TestCase):
             self.assertIn("当前项目是番茄钟应用", second_request)
             self.assertIn("inspect the current workspace files", second_request)
             self.assertFalse(any(event.startswith("[上下文]") for event in events))
+
+    def test_extension_hooks_can_inject_context_around_model_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            extension = RecordingExtension()
+            model = FakeModel([ModelReply(content="完成。")])
+
+            answer = Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                extensions=[extension],
+            ).run("检查扩展")
+
+            self.assertEqual(answer, "完成。")
+            request = json.dumps(model.received_messages[0], ensure_ascii=False)
+            self.assertIn("<extension_context>project note: beta", request)
+            self.assertIn("<extension_marker>before llm", request)
+            self.assertEqual(
+                extension.events,
+                [
+                    "start:检查扩展",
+                    "before_llm:1",
+                    "after_llm:1:完成。",
+                    "end:完成。:True",
+                ],
+            )
+
+    def test_extension_can_register_and_execute_a_custom_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "echo-1",
+                                "extension_echo",
+                                {"text": "hello"},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="扩展工具完成。"),
+                ]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                extensions=[EchoToolExtension()],
+            ).run("调用扩展工具")
+
+            self.assertEqual(answer, "扩展工具完成。")
+            tool_names = {tool["function"]["name"] for tool in model.received_tools[0]}
+            self.assertIn("extension_echo", tool_names)
+            second_request = json.dumps(model.received_messages[1], ensure_ascii=False)
+            self.assertIn("extension echo: hello", second_request)
+
+    def test_extension_can_block_a_tool_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "secret.txt").write_text("hidden\n", encoding="utf-8")
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall("read-1", "read_file", {"path": "secret.txt"}),
+                        ),
+                    ),
+                    ModelReply(content="读取已被拦截。"),
+                ]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(root),
+                extensions=[BlockingExtension()],
+            ).run("读取文件")
+
+            self.assertEqual(answer, "读取已被拦截。")
+            second_request = json.dumps(model.received_messages[1], ensure_ascii=False)
+            self.assertIn("tool call blocked by extension", second_request)
+            self.assertNotIn("hidden", second_request)
 
     def test_new_agent_instance_receives_persistent_project_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

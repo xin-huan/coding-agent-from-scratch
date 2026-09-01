@@ -58,7 +58,7 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertIn("Do not use", description)
         self.assertIn("python -c", description)
 
-    def test_reuses_unchanged_read_and_invalidates_after_write(self) -> None:
+    def test_read_file_always_returns_current_file_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -73,10 +73,9 @@ class ToolRegistryTests(unittest.TestCase):
             third = registry.execute("read_file", {"path": "module.py"})
 
         self.assertIn("VALUE = 1", first)
-        self.assertIn("unchanged read cache hit", second)
-        self.assertNotIn("VALUE = 1", second)
+        self.assertIn("VALUE = 1", second)
         self.assertIn("VALUE = 2", third)
-        self.assertEqual(registry.read_cache_hits, 1)
+        self.assertFalse(hasattr(registry, "read_cache_hits"))
 
 
 if __name__ == "__main__":

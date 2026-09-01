@@ -9,7 +9,6 @@ from typing import Sequence
 
 from coding_agent.agent import DEFAULT_MAX_STEPS, Agent
 from coding_agent.config import ConfigError, Settings
-from coding_agent.context import ContextManager
 from coding_agent.model import DeepSeekModel
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
@@ -34,12 +33,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repeat", type=int, default=1, help="Runs per selected case")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
-    parser.add_argument(
-        "--context-mode",
-        choices=("off", "v2", "v3"),
-        default="off",
-        help="Choose an experimental context manager version; default is off",
-    )
     parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS_DIR)
     return parser
 
@@ -58,23 +51,16 @@ def _select_cases(parser: argparse.ArgumentParser, requested: list[str]) -> list
 def _real_agent_runner(
     settings: Settings,
     max_steps: int,
-    context_mode: str,
 ) -> AgentRunner:
     model = DeepSeekModel(settings)
 
     def run(workspace: Path, task: str, trace_path: Path) -> str:
-        context_manager = ContextManager(
-            enabled=context_mode != "off",
-            mode="v2" if context_mode == "off" else context_mode,
-            archive_path=trace_path.with_name("context-history.jsonl"),
-        )
         agent = Agent(
             model,
             Workspace(workspace),
             max_steps=max_steps,
             on_event=print,
             trace=JsonlTrace(trace_path),
-            context_manager=context_manager,
         )
         return agent.run(task)
 
@@ -101,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     session_name = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     session_dir = args.output.resolve() / session_name
     session_dir.mkdir(parents=True)
-    run_agent = _real_agent_runner(settings, args.max_steps, args.context_mode)
+    run_agent = _real_agent_runner(settings, args.max_steps)
     results: list[EvalResult] = []
 
     for case in selected:

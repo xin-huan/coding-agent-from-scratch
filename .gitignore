@@ -218,7 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Local planning notes and collected materials
-docs/
+docs/*
+!docs/
+!docs/agent-design-review.md
 
 # Local development memory
 agent.md

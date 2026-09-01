@@ -169,11 +169,8 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
 
 
 class ToolRegistry:
-    def __init__(self, workspace: Workspace, *, cache_reads: bool = True) -> None:
+    def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
-        self.cache_reads = cache_reads
-        self._read_cache: dict[tuple[str, int | None, int | None], tuple[str, str]] = {}
-        self.read_cache_hits = 0
         self.last_metadata: dict[str, object] = {}
 
     @property
@@ -181,8 +178,7 @@ class ToolRegistry:
         return TOOL_DEFINITIONS
 
     def start_task(self) -> None:
-        self._read_cache.clear()
-        self.read_cache_hits = 0
+        self.last_metadata = {}
 
     def execute(self, name: str, arguments: Mapping[str, object]) -> str:
         self.last_metadata = {}
@@ -204,32 +200,15 @@ class ToolRegistry:
                 raise ValueError("read_file.end_line must be an integer")
             cache_key = self._read_cache_key(path, start_line, end_line)
             version = self._file_version(path)
-            if self.cache_reads and version:
-                cached = self._cached_read(cache_key, version)
-                if cached is not None:
-                    self.read_cache_hits += 1
-                    self.last_metadata = {
-                        "path": cache_key[0],
-                        "version": version,
-                        "read_cache_hit": True,
-                    }
-                    return (
-                        f"unchanged read cache hit: {cache_key[0]} "
-                        f"(version {version[:12]}). Reuse the earlier content; "
-                        "the full result remains in local context history."
-                    )
             result = read_file(
                 self.workspace,
                 path,
                 start_line=start_line,
                 end_line=end_line,
             )
-            if self.cache_reads and version:
-                self._read_cache[cache_key] = (version, result)
             self.last_metadata = {
                 "path": cache_key[0],
                 "version": version,
-                "read_cache_hit": False,
             }
             return result
 
@@ -246,7 +225,6 @@ class ToolRegistry:
             if not isinstance(path, str) or not isinstance(content, str):
                 raise ValueError("write_file path and content must be strings")
             result = write_file(self.workspace, path, content)
-            self._invalidate_read_cache(path)
             self.last_metadata = {
                 "path": self._read_cache_key(path, None, None)[0],
                 "version": self._file_version(path),
@@ -263,7 +241,6 @@ class ToolRegistry:
             if not isinstance(old_text, str) or not isinstance(new_text, str):
                 raise ValueError("apply_patch arguments must be strings")
             result = apply_patch(self.workspace, path, old_text, new_text)
-            self._invalidate_read_cache(path)
             self.last_metadata = {
                 "path": self._read_cache_key(path, None, None)[0],
                 "version": self._file_version(path),
@@ -314,21 +291,3 @@ class ToolRegistry:
             return resolved.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return ""
-
-    def _cached_read(
-        self,
-        requested: tuple[str, int | None, int | None],
-        version: str,
-    ) -> tuple[str, str] | None:
-        exact = self._read_cache.get(requested)
-        if exact is not None and exact[0] == version:
-            return exact
-        return None
-
-    def _invalidate_read_cache(self, path: str) -> None:
-        normalized = self._read_cache_key(path, None, None)[0]
-        self._read_cache = {
-            key: value
-            for key, value in self._read_cache.items()
-            if key[0] != normalized
-        }

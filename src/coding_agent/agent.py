@@ -5,10 +5,17 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from coding_agent.checkpoint import CheckpointError, CheckpointStore
-from coding_agent.context import ContextManager, ContextStats
+from coding_agent.extensions import (
+    AgentExtension,
+    ExtensionContext,
+    ExtensionManager,
+    ProjectMemoryExtension,
+    SkillSelectionExtension,
+    ToolResult,
+)
 from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.skills import SkillRegistry
 from coding_agent.tools.registry import ToolRegistry
@@ -514,23 +521,26 @@ class Agent:
         on_event: Callable[[str], None] | None = None,
         trace: Trace | None = None,
         checkpoint_store: CheckpointStore | None = None,
-        context_manager: ContextManager | None = None,
         memory_store: ProjectMemoryStore | None = None,
         skill_registry: SkillRegistry | None = None,
+        extensions: Sequence[AgentExtension] = (),
     ) -> None:
         self.model = model
         self.workspace = workspace
-        self.context_manager = context_manager or ContextManager(enabled=False)
-        self.tools = ToolRegistry(
-            workspace,
-            cache_reads=self.context_manager.enabled,
-        )
+        self.tools = ToolRegistry(workspace)
         self.max_steps = max_steps
         self.on_event = on_event or (lambda _message: None)
         self.trace = trace or NullTrace()
         self.checkpoint_store = checkpoint_store
-        self.memory_store = memory_store
-        self.skill_registry = skill_registry or SkillRegistry.load_builtin()
+        configured_extensions: list[AgentExtension] = []
+        if memory_store is not None:
+            configured_extensions.append(ProjectMemoryExtension(memory_store))
+        configured_extensions.append(
+            SkillSelectionExtension(skill_registry or SkillRegistry.load_builtin())
+        )
+        configured_extensions.extend(extensions)
+        self.extensions = ExtensionManager(configured_extensions)
+        self._extension_context: ExtensionContext | None = None
         self._pending_task: str | None = None
         self._prompt_tokens = 0
         self._completion_tokens = 0
@@ -548,17 +558,27 @@ class Agent:
                 f"User clarification:\n{task}"
             )
             self._pending_task = None
-        self.context_manager.start_task(reset=not self._session_tasks)
         self.tools.start_task()
         self.on_event("[状态] 正在分析任务")
         self.trace.record("task_start", task=task)
+        self._extension_context = ExtensionContext(
+            task=task,
+            workspace=self.workspace,
+            trace=self.trace,
+            emit=self.on_event,
+        )
+        self.extensions.on_session_start(self._extension_context)
         messages: list[dict[str, object]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
         ]
-        project_memory = self._project_memory_message()
-        if project_memory is not None:
-            messages.append(project_memory)
-            self.trace.record("project_memory_attached")
+        extension_messages = self.extensions.inject_context(self._extension_context)
+        if extension_messages:
+            messages.extend(extension_messages)
+            self.trace.record(
+                "extension_context_injected",
+                count=len(extension_messages),
+                extensions=self.extensions.names(),
+            )
         session_context = self._session_context_message()
         if session_context is not None:
             messages.append(session_context)
@@ -566,12 +586,6 @@ class Agent:
                 "session_context_attached",
                 completed_tasks=len(self._session_tasks),
             )
-        selected_skills = self.skill_registry.select(task)
-        if selected_skills:
-            skill_names = [skill.name for skill in selected_skills]
-            messages.extend(skill.message() for skill in selected_skills)
-            self.trace.record("skills_selected", skills=skill_names)
-            self.on_event(f"[技能] 已启用：{', '.join(skill_names)}")
         messages.append({"role": "user", "content": task})
         state = TaskState(task)
 
@@ -585,14 +599,24 @@ class Agent:
             if question is not None:
                 return question
 
-        answer = self._continue(task, messages, state, step=1)
-        self._remember_completed_task(task, answer, state)
-        return answer
-
-    def _project_memory_message(self) -> dict[str, object] | None:
-        if self.memory_store is None:
-            return None
-        return self.memory_store.build_message(self.workspace)
+        answer: str | None = None
+        error: Exception | None = None
+        try:
+            answer = self._continue(task, messages, state, step=1)
+            self._remember_completed_task(task, answer, state)
+            return answer
+        except Exception as caught:
+            error = caught
+            raise
+        finally:
+            if self._extension_context is not None:
+                self.extensions.on_session_end(
+                    self._extension_context,
+                    answer=answer,
+                    error=error,
+                    state=state,
+                )
+            self._extension_context = None
 
     def _session_context_message(self) -> dict[str, object] | None:
         if not self._session_tasks:
@@ -640,16 +664,6 @@ class Agent:
             completed_tasks=len(self._session_tasks),
             modified_files=state.modified_files,
         )
-        if self.memory_store is not None:
-            self.memory_store.update_after_task(
-                self.workspace,
-                task=task,
-                answer=answer,
-                modified_files=state.modified_files,
-                latest_command=state.latest_command,
-            )
-            self.trace.record("project_memory_updated")
-
     def _run_creation_planning_gate(
         self,
         task: str,
@@ -831,20 +845,12 @@ class Agent:
             {"role": "user", "content": task},
         ]
         self.trace.record("model_request", step=0, clarification_gate=True)
-        try:
-            reply = self.model.complete(
-                messages,
-                [ASK_USER_DEFINITION, PROCEED_TASK_DEFINITION],
-            )
-        except Exception as error:
-            self._observe_error_usage(error, step=0)
-            self.trace.record(
-                "task_error",
-                step=0,
-                error_type=type(error).__name__,
-            )
-            raise AgentError(f"Clarification check failed: {error}") from error
-        self._observe_usage(reply, step=0)
+        reply = self._complete_model_request(
+            messages,
+            [ASK_USER_DEFINITION, PROCEED_TASK_DEFINITION],
+            step=0,
+            error_prefix="Clarification check",
+        )
         self.trace.record(
             "model_reply",
             step=0,
@@ -912,16 +918,38 @@ class Agent:
             raise AgentError(str(error)) from error
 
         self.trace.record("task_resumed", task=task, step=step)
-        answer = self._continue(
-            task,
-            messages,
-            state,
-            step=step,
-            pending_calls=pending_calls,
-            next_call_index=next_call_index,
+        self._extension_context = ExtensionContext(
+            task=task,
+            workspace=self.workspace,
+            trace=self.trace,
+            emit=self.on_event,
         )
-        self._remember_completed_task(task, answer, state)
-        return answer
+        self.extensions.on_session_start(self._extension_context)
+        answer: str | None = None
+        error: Exception | None = None
+        try:
+            answer = self._continue(
+                task,
+                messages,
+                state,
+                step=step,
+                pending_calls=pending_calls,
+                next_call_index=next_call_index,
+            )
+            self._remember_completed_task(task, answer, state)
+            return answer
+        except Exception as caught:
+            error = caught
+            raise
+        finally:
+            if self._extension_context is not None:
+                self.extensions.on_session_end(
+                    self._extension_context,
+                    answer=answer,
+                    error=error,
+                    state=state,
+                )
+            self._extension_context = None
 
     def _continue(
         self,
@@ -954,9 +982,7 @@ class Agent:
             request_messages = self._build_request_context(
                 messages,
                 [state.message(self.max_steps - step + 1)],
-                step=step,
                 contract_messages=[state.contract_message()],
-                tools=action_tools,
             )
             reply = self._complete_action_request(
                 request_messages,
@@ -966,11 +992,6 @@ class Agent:
 
             self.trace.record(
                 "model_reply",
-                step=step,
-                content=reply.content,
-                tools=[call.name for call in reply.tool_calls],
-            )
-            self.context_manager.record_step(
                 step=step,
                 content=reply.content,
                 tools=[call.name for call in reply.tool_calls],
@@ -1097,47 +1118,23 @@ class Agent:
                 for definition in definitions
                 if definition.get("function", {}).get("name") in allowed
             ]
-        return [*definitions, ASK_USER_DEFINITION]
+        extension_tools: list[dict[str, object]] = []
+        if self._extension_context is not None:
+            extension_tools = self.extensions.tool_definitions(self._extension_context)
+        return [*definitions, *extension_tools, ASK_USER_DEFINITION]
 
     def _build_request_context(
         self,
         messages: list[dict[str, object]],
         tail_messages: list[dict[str, object]],
         *,
-        step: int,
         contract_messages: list[dict[str, object]] | None = None,
-        tools: list[dict[str, object]] | None = None,
     ) -> list[dict[str, object]]:
-        request = self.context_manager.build(
-            messages,
-            contract_messages=contract_messages,
-            state_messages=tail_messages,
-            tools=tools,
-        )
-        stats: ContextStats = self.context_manager.last_stats
-        self.trace.record(
-            "context_built",
-            step=step,
-            original_characters=stats.original_characters,
-            sent_characters=stats.sent_characters,
-            saved_characters=stats.saved_characters,
-            original_tokens=stats.original_tokens,
-            sent_tokens=stats.sent_tokens,
-            saved_tokens=stats.saved_tokens,
-            tool_definition_tokens=stats.tool_definition_tokens,
-            summarized_messages=stats.summarized_messages,
-            retrieved_entries=stats.retrieved_entries,
-            context_mode=self.context_manager.mode,
-        )
-        if stats.summarized_messages:
-            percent = round(
-                stats.saved_tokens * 100 / max(1, stats.original_tokens)
-            )
-            self.on_event(
-                f"[上下文] 已压缩 {stats.summarized_messages} 条旧消息，"
-                f"本轮预计 Token 减少约 {percent}%"
-            )
-        return request
+        return [
+            *messages,
+            *(contract_messages or []),
+            *tail_messages,
+        ]
 
     def _observe_usage(self, reply: ModelReply, *, step: int) -> None:
         usage = reply.usage
@@ -1146,7 +1143,6 @@ class Agent:
         self._prompt_tokens += usage.prompt_tokens
         self._completion_tokens += usage.completion_tokens
         self._cache_hit_tokens += usage.cache_hit_tokens
-        self.context_manager.observe_prompt_usage(usage.prompt_tokens)
         total = self._prompt_tokens + self._completion_tokens
         self.on_event(
             f"[Token] 本次输入 {usage.prompt_tokens}，输出 {usage.completion_tokens}；"
@@ -1177,11 +1173,24 @@ class Agent:
         step: int,
         error_prefix: str,
     ) -> ModelReply:
+        if self._extension_context is not None:
+            request_messages, tools = self.extensions.before_llm_call(
+                self._extension_context,
+                step=step,
+                messages=request_messages,
+                tools=tools,
+            )
         retry_messages = request_messages
         for attempt in range(2):
             try:
                 reply = self.model.complete(retry_messages, tools)
                 self._observe_usage(reply, step=step)
+                if self._extension_context is not None:
+                    self.extensions.after_llm_call(
+                        self._extension_context,
+                        step=step,
+                        reply=reply,
+                    )
                 return reply
             except Exception as error:
                 self._observe_error_usage(error, step=step)
@@ -1225,6 +1234,39 @@ class Agent:
     ) -> None:
         for index in range(start_index, len(calls)):
             call = calls[index]
+            if self._extension_context is not None:
+                extension_call = self.extensions.before_tool_call(
+                    self._extension_context,
+                    step=step,
+                    call=call,
+                )
+                if extension_call is None:
+                    result = f"ERROR: tool call blocked by extension: {call.name}"
+                    success = False
+                    self.trace.record(
+                        "tool_blocked",
+                        step=step,
+                        tool=call.name,
+                        arguments=call.arguments,
+                    )
+                    state.update(call, result, success)
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result,
+                        }
+                    )
+                    self._save_checkpoint(
+                        task,
+                        messages,
+                        state,
+                        step,
+                        calls,
+                        next_call_index=index + 1,
+                    )
+                    continue
+                call = extension_call
             if call.name in {"list_files", "read_file", "search_text"}:
                 self.on_event("[状态] 正在检查项目")
             elif call.name in {"write_file", "apply_patch"}:
@@ -1241,28 +1283,39 @@ class Agent:
                 tool=call.name,
                 arguments=call.arguments,
             )
-            try:
-                result = self.tools.execute(call.name, call.arguments)
-            except (OSError, ValueError) as error:
-                result = f"ERROR: {error}"
-                success = False
+            extension_result = None
+            if self._extension_context is not None:
+                extension_result = self.extensions.execute_tool(
+                    self._extension_context,
+                    step=step,
+                    call=call,
+                )
+            if extension_result is not None:
+                result = extension_result.content
+                success = extension_result.success
             else:
-                success = True
+                try:
+                    result = self.tools.execute(call.name, call.arguments)
+                except (OSError, ValueError) as error:
+                    result = f"ERROR: {error}"
+                    success = False
+                else:
+                    success = True
+            if self._extension_context is not None:
+                extension_result = self.extensions.after_tool_call(
+                    self._extension_context,
+                    step=step,
+                    call=call,
+                    result=ToolResult(result, success),
+                )
+                result = extension_result.content
+                success = extension_result.success
             if _is_full_test_command(call):
                 if "Exit code: 0" in result:
                     self.on_event("[状态] 测试通过，正在整理结果")
                 else:
                     self.on_event("[状态] 测试失败，正在分析原因")
             state.update(call, result, success)
-            self.context_manager.record_tool(
-                step=step,
-                name=call.name,
-                arguments=call.arguments,
-                result=result,
-                success=success,
-                version=str(self.tools.last_metadata.get("version", "")),
-                file_content=str(self.tools.last_metadata.get("content", "")),
-            )
             self.trace.record(
                 "tool_result",
                 step=step,
@@ -1270,25 +1323,11 @@ class Agent:
                 success=success,
                 result=result,
             )
-            if call.name == "read_file" and result.startswith(
-                "unchanged read cache hit:"
-            ):
-                self.trace.record(
-                    "read_cache_hit",
-                    step=step,
-                    path=call.arguments.get("path", ""),
-                )
-            distilled_result = self.context_manager.distill_tool_result(
-                call.name,
-                call.arguments,
-                result,
-                success=success,
-            )
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": distilled_result,
+                    "content": result,
                 }
             )
             self._save_checkpoint(
@@ -1396,9 +1435,7 @@ class Agent:
                 state.message(0),
                 {"role": "system", "content": instruction},
             ],
-            step=step,
             contract_messages=[state.contract_message()],
-            tools=[],
         )
         self.trace.record(
             "model_request",
@@ -1406,17 +1443,12 @@ class Agent:
             finalization=True,
             reason=reason,
         )
-        try:
-            reply = self.model.complete(request_messages, [])
-        except Exception as error:
-            self._observe_error_usage(error, step=step)
-            self.trace.record(
-                "task_error",
-                step=step,
-                error_type=type(error).__name__,
-            )
-            raise AgentError(f"Final model request failed: {error}") from error
-        self._observe_usage(reply, step=step)
+        reply = self._complete_model_request(
+            request_messages,
+            [],
+            step=step,
+            error_prefix="Final model request",
+        )
 
         self.trace.record(
             "model_reply",
@@ -1485,17 +1517,12 @@ class Agent:
             finalization=True,
             retry=True,
         )
-        try:
-            reply = self.model.complete(retry_messages, [])
-        except Exception as error:
-            self._observe_error_usage(error, step=step)
-            self.trace.record(
-                "task_error",
-                step=step,
-                error_type=type(error).__name__,
-            )
-            raise AgentError(f"Final model retry failed: {error}") from error
-        self._observe_usage(reply, step=step)
+        reply = self._complete_model_request(
+            retry_messages,
+            [],
+            step=step,
+            error_prefix="Final model retry",
+        )
 
         self.trace.record(
             "model_reply",

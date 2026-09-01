@@ -103,6 +103,21 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(loaded.messages[0].role, "user")
             self.assertEqual(loaded.messages[1].events, ["[工具] list_files"])
 
+    def test_chat_store_pins_and_deletes_conversations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "conversations.json"
+            store = ChatStore(path)
+            first = store.create_conversation("project-1", "普通对话")
+            second = store.create_conversation("project-1", "置顶对话")
+
+            store.pin_conversation(first.id, True)
+            store.delete_conversation(second.id)
+            reloaded = ChatStore(path)
+            conversations = reloaded.list_conversations()
+
+            self.assertEqual([conversation.id for conversation in conversations], [first.id])
+            self.assertTrue(conversations[0].pinned)
+
     def test_chat_app_adds_project_and_saves_sent_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir) / "data"
@@ -196,6 +211,26 @@ class ChatTests(unittest.TestCase):
         self.assertIn("<pre><code>", INDEX_HTML)
         self.assertNotIn("${escapeHtml(message.content)}${events}", INDEX_HTML)
 
+    def test_chat_ui_groups_conversations_under_projects(self) -> None:
+        self.assertIn('id="projectTree"', INDEX_HTML)
+        self.assertIn("renderProjectTree", INDEX_HTML)
+        self.assertIn("data-project-id", INDEX_HTML)
+        self.assertIn("data-conversation-id", INDEX_HTML)
+        self.assertIn("data-pin-id", INDEX_HTML)
+        self.assertIn("data-delete-id", INDEX_HTML)
+        self.assertNotIn('id="projectSelect"', INDEX_HTML)
+        self.assertNotIn('id="conversationList"', INDEX_HTML)
+
+    def test_chat_ui_has_day_navigation_and_collapsed_finished_events(self) -> None:
+        self.assertIn('id="dayNav"', INDEX_HTML)
+        self.assertIn("renderDayNav", INDEX_HTML)
+        self.assertIn("daysForMessages", INDEX_HTML)
+        self.assertIn("day-separator", INDEX_HTML)
+        self.assertIn("scrollIntoView", INDEX_HTML)
+        self.assertIn("<details class=\"events-details\">", INDEX_HTML)
+        self.assertIn("执行过程 ${message.events.length} 条", INDEX_HTML)
+        self.assertIn("if (message.pending) return body", INDEX_HTML)
+
     def test_chat_app_can_pick_and_rename_project_and_conversation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir) / "data"
@@ -220,6 +255,53 @@ class ChatTests(unittest.TestCase):
             self.assertEqual(renamed_conversation["title"], "性能测试")
             self.assertEqual(state["projects"][0]["display_name"], "番茄钟")
             self.assertEqual(state["conversations"][0]["title"], "性能测试")
+
+    def test_chat_app_can_pin_and_delete_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            project = Path(temp_dir) / "project"
+            project.mkdir()
+            app = FakeChatApp(
+                data_dir,
+                Settings(api_key="test-key", model="test-model"),
+            )
+            saved_project = app.add_project(str(project))
+            first = app.create_conversation(str(saved_project["id"]), "普通对话")
+            second = app.create_conversation(str(saved_project["id"]), "重要对话")
+
+            pinned = app.pin_conversation(str(first["id"]), True)
+            deleted = app.delete_conversation(str(second["id"]))
+            state = app.state()
+
+            self.assertTrue(pinned["pinned"])
+            self.assertEqual(deleted["deleted"], second["id"])
+            self.assertEqual(len(state["conversations"]), 1)
+            self.assertEqual(state["conversations"][0]["id"], first["id"])
+            self.assertTrue(state["conversations"][0]["pinned"])
+
+    def test_chat_app_rejects_deleting_running_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            project = Path(temp_dir) / "project"
+            project.mkdir()
+            app = SlowChatApp(
+                data_dir,
+                Settings(api_key="test-key", model="test-model"),
+            )
+            saved_project = app.add_project(str(project))
+            conversation = app.create_conversation(str(saved_project["id"]))
+
+            app.start_message(str(conversation["id"]), "生成番茄钟")
+            self.assertTrue(app.started.wait(timeout=2))
+            with self.assertRaises(RuntimeError):
+                app.delete_conversation(str(conversation["id"]))
+            app.finish.set()
+            for _ in range(50):
+                if not app.state()["running_conversations"]:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("background chat run did not finish")
 
 
 if __name__ == "__main__":

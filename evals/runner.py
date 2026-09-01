@@ -39,27 +39,6 @@ class EvalResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cache_hit_tokens: int = 0
-    context_original_characters: int = 0
-    context_sent_characters: int = 0
-    context_original_tokens: int = 0
-    context_sent_tokens: int = 0
-    retrieved_entries: int = 0
-    read_cache_hits: int = 0
-    context_mode: str = "unknown"
-
-    @property
-    def context_saved_percent(self) -> float:
-        if not self.context_original_characters:
-            return 0.0
-        saved = self.context_original_characters - self.context_sent_characters
-        return round(100 * max(saved, 0) / self.context_original_characters, 1)
-
-    @property
-    def context_token_saved_percent(self) -> float:
-        if not self.context_original_tokens:
-            return 0.0
-        saved = self.context_original_tokens - self.context_sent_tokens
-        return round(100 * max(saved, 0) / self.context_original_tokens, 1)
 
 
 def _snapshot(root: Path) -> dict[str, str]:
@@ -122,13 +101,6 @@ class TraceMetrics:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cache_hit_tokens: int = 0
-    context_original_characters: int = 0
-    context_sent_characters: int = 0
-    context_original_tokens: int = 0
-    context_sent_tokens: int = 0
-    retrieved_entries: int = 0
-    read_cache_hits: int = 0
-    context_mode: str = "unknown"
 
 
 def _trace_metrics(path: Path) -> TraceMetrics:
@@ -139,13 +111,6 @@ def _trace_metrics(path: Path) -> TraceMetrics:
     prompt_tokens = 0
     completion_tokens = 0
     cache_hit_tokens = 0
-    context_original_characters = 0
-    context_sent_characters = 0
-    context_original_tokens = 0
-    context_sent_tokens = 0
-    retrieved_entries = 0
-    read_cache_hits = 0
-    context_mode = "unknown"
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
@@ -161,32 +126,12 @@ def _trace_metrics(path: Path) -> TraceMetrics:
             prompt_tokens += _integer_metric(data.get("prompt_tokens"))
             completion_tokens += _integer_metric(data.get("completion_tokens"))
             cache_hit_tokens += _integer_metric(data.get("cache_hit_tokens"))
-        elif event == "context_built":
-            context_original_characters += _integer_metric(
-                data.get("original_characters")
-            )
-            context_sent_characters += _integer_metric(data.get("sent_characters"))
-            context_original_tokens += _integer_metric(data.get("original_tokens"))
-            context_sent_tokens += _integer_metric(data.get("sent_tokens"))
-            retrieved_entries += _integer_metric(data.get("retrieved_entries"))
-            mode = data.get("context_mode")
-            if isinstance(mode, str):
-                context_mode = mode
-        elif event == "read_cache_hit":
-            read_cache_hits += 1
     return TraceMetrics(
         model_calls=model_calls,
         tool_calls=tool_calls,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         cache_hit_tokens=cache_hit_tokens,
-        context_original_characters=context_original_characters,
-        context_sent_characters=context_sent_characters,
-        context_original_tokens=context_original_tokens,
-        context_sent_tokens=context_sent_tokens,
-        retrieved_entries=retrieved_entries,
-        read_cache_hits=read_cache_hits,
-        context_mode=context_mode,
     )
 
 
@@ -292,13 +237,6 @@ def evaluate_case(
         prompt_tokens=metrics.prompt_tokens,
         completion_tokens=metrics.completion_tokens,
         cache_hit_tokens=metrics.cache_hit_tokens,
-        context_original_characters=metrics.context_original_characters,
-        context_sent_characters=metrics.context_sent_characters,
-        context_original_tokens=metrics.context_original_tokens,
-        context_sent_tokens=metrics.context_sent_tokens,
-        retrieved_entries=metrics.retrieved_entries,
-        read_cache_hits=metrics.read_cache_hits,
-        context_mode=metrics.context_mode,
     )
     (run_dir / "answer.txt").write_text(answer, encoding="utf-8")
     (run_dir / "grader.txt").write_text(grader_output, encoding="utf-8")
@@ -326,24 +264,6 @@ def write_summary(results: list[EvalResult], output_dir: Path) -> None:
     prompt_tokens = sum(result.prompt_tokens for result in results)
     completion_tokens = sum(result.completion_tokens for result in results)
     cache_hit_tokens = sum(result.cache_hit_tokens for result in results)
-    context_original = sum(result.context_original_characters for result in results)
-    context_sent = sum(result.context_sent_characters for result in results)
-    context_original_tokens = sum(result.context_original_tokens for result in results)
-    context_sent_tokens = sum(result.context_sent_tokens for result in results)
-    retrieved_entries = sum(result.retrieved_entries for result in results)
-    read_cache_hits = sum(result.read_cache_hits for result in results)
-    context_saved_percent = (
-        100 * max(context_original - context_sent, 0) / context_original
-        if context_original
-        else 0.0
-    )
-    context_token_saved_percent = (
-        100
-        * max(context_original_tokens - context_sent_tokens, 0)
-        / context_original_tokens
-        if context_original_tokens
-        else 0.0
-    )
     lines = [
         "# Eval Report",
         "",
@@ -354,12 +274,6 @@ def write_summary(results: list[EvalResult], output_dir: Path) -> None:
         f"- Prompt tokens: {prompt_tokens}",
         f"- Completion tokens: {completion_tokens}",
         f"- Cache-hit tokens: {cache_hit_tokens}",
-        f"- Estimated context tokens sent: {context_sent_tokens}/"
-        f"{context_original_tokens} ({context_token_saved_percent:.1f}% saved)",
-        f"- Context characters sent: {context_sent}/{context_original} "
-        f"({context_saved_percent:.1f}% saved)",
-        f"- Retrieved history entries: {retrieved_entries}",
-        f"- Unchanged read cache hits: {read_cache_hits}",
         "",
         "## Categories",
         "",
@@ -380,21 +294,19 @@ def write_summary(results: list[EvalResult], output_dir: Path) -> None:
             "",
             "## Cases",
             "",
-            "| Case | Mode | Category | Result | Agent | Acceptance | Score | Seconds | Models | Tools | Input tok | Output tok | Est. context saved | Read cache | Failure |",
-            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            "| Case | Category | Result | Agent | Acceptance | Score | Seconds | Models | Tools | Input tok | Output tok | Failure |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     for result in results:
         lines.append(
-            f"| {result.case_id} | {result.context_mode} | {result.category} | "
+            f"| {result.case_id} | {result.category} | "
             f"{'PASS' if result.passed else 'FAIL'} | "
             f"{'yes' if result.agent_completed else 'no'} | "
             f"{'yes' if result.acceptance_passed else 'no'} | {result.score:.1f} | "
             f"{result.duration_seconds:.3f} | {result.model_calls} | "
             f"{result.tool_calls} | {result.prompt_tokens} | "
             f"{result.completion_tokens} | "
-            f"{result.context_token_saved_percent:.1f}% | "
-            f"{result.read_cache_hits} | "
             f"{result.failure_reason or ''} |"
         )
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -415,13 +327,6 @@ def write_summary(results: list[EvalResult], output_dir: Path) -> None:
                     "tool_calls": result.tool_calls,
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
-                    "context_saved_percent": result.context_saved_percent,
-                    "context_token_saved_percent": (
-                        result.context_token_saved_percent
-                    ),
-                    "retrieved_entries": result.retrieved_entries,
-                    "read_cache_hits": result.read_cache_hits,
-                    "context_mode": result.context_mode,
                     "agent_completed": result.agent_completed,
                     "acceptance_passed": result.acceptance_passed,
                     "diagnosis": "",
