@@ -42,13 +42,11 @@ class DeepSeekModel:
 
         tool_calls: list[ToolCall] = []
         for call in message.tool_calls or []:
-            try:
-                arguments = json.loads(call.function.arguments)
-            except (TypeError, json.JSONDecodeError) as error:
-                raise ModelError(
-                    f"Invalid arguments for tool {call.function.name}",
-                    usage=usage,
-                ) from error
+            arguments = _parse_tool_arguments(
+                call.function.arguments,
+                call.function.name,
+                usage,
+            )
             if not isinstance(arguments, dict):
                 raise ModelError(
                     f"Tool arguments must be an object: {call.function.name}",
@@ -67,6 +65,32 @@ class DeepSeekModel:
             tool_calls=tuple(tool_calls),
             usage=usage,
         )
+
+
+def _parse_tool_arguments(
+    raw_arguments: object,
+    tool_name: str,
+    usage: TokenUsage | None,
+) -> object:
+    if not isinstance(raw_arguments, str):
+        raise ModelError(f"Invalid arguments for tool {tool_name}", usage=usage)
+    try:
+        return json.loads(raw_arguments)
+    except json.JSONDecodeError as strict_error:
+        stripped = raw_arguments.strip()
+        try:
+            parsed, _end = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError as raw_error:
+            raise ModelError(
+                f"Invalid arguments for tool {tool_name}",
+                usage=usage,
+            ) from raw_error
+        if not isinstance(parsed, dict):
+            raise ModelError(
+                f"Invalid arguments for tool {tool_name}",
+                usage=usage,
+            ) from strict_error
+        return parsed
 
 
 def _response_usage(response: Any) -> TokenUsage | None:

@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -6,7 +7,12 @@ from pathlib import Path
 
 from coding_agent.agent import Agent, ModelReply, TaskState, TokenUsage, ToolCall
 from coding_agent.checkpoint import CheckpointStore
-from coding_agent.extensions import BaseExtension, ToolResult
+from coding_agent.extensions import (
+    BaseExtension,
+    ContextPackExtension,
+    ExtensionContext,
+    ToolResult,
+)
 from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace
@@ -111,6 +117,26 @@ class BlockingExtension(BaseExtension):
         if call.name == "read_file":
             return None
         return call
+
+
+class CompactionObserverExtension(BaseExtension):
+    name = "compaction-observer"
+
+    def __init__(self) -> None:
+        self.events: list[tuple[int, int, int, int]] = []
+
+    def on_context_compact(
+        self,
+        context,
+        *,
+        step: int,
+        original_characters: int,
+        sent_characters: int,
+        compacted_messages: int,
+    ) -> None:
+        self.events.append(
+            (step, original_characters, sent_characters, compacted_messages)
+        )
 
 
 def write_smoke_suite(root: Path, *, passing: bool = True) -> None:
@@ -276,6 +302,152 @@ class AgentTests(unittest.TestCase):
             second_request = json.dumps(model.received_messages[1], ensure_ascii=False)
             self.assertIn("tool call blocked by extension", second_request)
             self.assertNotIn("hidden", second_request)
+
+    def test_context_pack_compacts_old_tool_exchanges_but_keeps_recent_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            trace = JsonlTrace(root / "trace.jsonl")
+            observer = CompactionObserverExtension()
+            for name, marker in (
+                ("old.txt", "OLD_UNIQUE_MARKER"),
+                ("middle.txt", "MID_UNIQUE_MARKER"),
+                ("recent.txt", "RECENT_UNIQUE_MARKER"),
+            ):
+                lines = [f"{name} line {index:03d}" for index in range(1, 260)]
+                lines[129] = marker
+                (root / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(ToolCall("read-1", "read_file", {"path": "old.txt"}),),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall("read-2", "read_file", {"path": "middle.txt"}),
+                        ),
+                    ),
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall("read-3", "read_file", {"path": "recent.txt"}),
+                        ),
+                    ),
+                    ModelReply(content="检查完成。"),
+                ]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(root),
+                trace=trace,
+                extensions=[observer],
+                context_pack=ContextPackExtension(
+                    max_characters=4_000,
+                    recent_tool_exchanges=1,
+                ),
+            ).run("检查这些文件")
+
+            self.assertEqual(answer, "检查完成。")
+            final_request = json.dumps(model.received_messages[-1], ensure_ascii=False)
+            self.assertIn("<compacted_history>", final_request)
+            self.assertIn("Checked:", final_request)
+            self.assertIn("Findings:", final_request)
+            self.assertIn("Next:", final_request)
+            self.assertIn("read old.txt", final_request)
+            self.assertNotIn("OLD_UNIQUE_MARKER", final_request)
+            self.assertNotIn("MID_UNIQUE_MARKER", final_request)
+            self.assertIn("RECENT_UNIQUE_MARKER", final_request)
+            self.assertTrue(observer.events)
+            self.assertLess(observer.events[-1][2], observer.events[-1][1])
+            trace_events = [
+                json.loads(line)
+                for line in trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                any(event["event"] == "context_pack_built" for event in trace_events)
+            )
+
+    def test_context_pack_offloads_large_outputs_and_can_read_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = "HIDDEN_FULL_OUTPUT_MARKER"
+            lines = [f"large line {index:03d}" for index in range(1, 520)]
+            lines[259] = marker
+            (root / "large.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            trace = JsonlTrace(root / "trace.jsonl")
+            context_pack = ContextPackExtension(
+                offload_characters=1_000,
+                output_store=root / "context-store",
+            )
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall("read-1", "read_file", {"path": "large.txt"}),
+                        ),
+                    ),
+                    ModelReply(content="大输出检查完成。"),
+                ]
+            )
+
+            answer = Agent(
+                model,
+                Workspace(root),
+                trace=trace,
+                context_pack=context_pack,
+            ).run("读取大文件")
+
+            self.assertEqual(answer, "大输出检查完成。")
+            second_request = json.dumps(model.received_messages[-1], ensure_ascii=False)
+            tool_message = next(
+                message
+                for message in model.received_messages[-1]
+                if message.get("role") == "tool"
+            )
+            tool_content = str(tool_message.get("content", ""))
+            tool_names = json.dumps(model.received_tools[-1], ensure_ascii=False)
+            self.assertIn("<offloaded_tool_result", tool_content)
+            self.assertIn("read_context_output", tool_names)
+            self.assertNotIn(marker, second_request)
+            match = re.search(r'output_id="([^"]+)"', tool_content)
+            self.assertIsNotNone(match)
+            assert match is not None
+            context = ExtensionContext(
+                task="读取大文件",
+                workspace=Workspace(root),
+                trace=trace,
+                emit=lambda _message: None,
+            )
+            retrieved = context_pack.execute_tool(
+                context,
+                step=99,
+                call=ToolCall(
+                    "ctx-read",
+                    ContextPackExtension.READ_OUTPUT_TOOL,
+                    {
+                        "output_id": match.group(1),
+                        "start_line": 255,
+                        "end_line": 265,
+                    },
+                ),
+            )
+
+            self.assertIsNotNone(retrieved)
+            assert retrieved is not None
+            self.assertTrue(retrieved.success)
+            self.assertIn(marker, retrieved.content)
+            trace_events = [
+                json.loads(line)
+                for line in trace.path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                any(event["event"] == "context_output_offloaded" for event in trace_events)
+            )
 
     def test_new_agent_instance_receives_persistent_project_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -861,7 +1033,13 @@ class AgentTests(unittest.TestCase):
             }
             self.assertEqual(
                 available,
-                {"write_file", "apply_patch", "run_command", "ask_user"},
+                {
+                    "write_file",
+                    "apply_patch",
+                    "run_command",
+                    "read_context_output",
+                    "ask_user",
+                },
             )
 
     def test_plain_command_does_not_count_as_full_verification(self) -> None:
@@ -939,6 +1117,40 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(state.missing_deliverables, [])
         self.assertEqual(state.phase, "verify")
+
+    def test_creation_accepts_clear_usage_doc_in_entry_point_docstring(self) -> None:
+        state = TaskState(
+            "创建 Python 桌面应用",
+            creation_task=True,
+            plan=["实现应用", "编写测试", "写使用说明", "运行测试"],
+        )
+
+        state.update(
+            ToolCall(
+                "call-1",
+                "write_file",
+                {
+                    "path": "main.py",
+                    "content": (
+                        '"""Usage: run with python main.py to launch the app."""\n'
+                        "print('ok')\n"
+                    ),
+                },
+            ),
+            "Wrote main.py",
+            success=True,
+        )
+        state.update(
+            ToolCall(
+                "call-2",
+                "write_file",
+                {"path": "tests/test_main.py", "content": "def test_ok(): pass\n"},
+            ),
+            "Wrote tests/test_main.py",
+            success=True,
+        )
+
+        self.assertNotIn("usage documentation", state.missing_deliverables)
 
     def test_zero_discovered_tests_do_not_count_as_verification(self) -> None:
         call = ToolCall(

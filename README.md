@@ -31,6 +31,12 @@ Built-in skills:
 - `web-ui`: handle immediate UI feedback, progress states, errors, and request/rendering paths.
 - `project-summary`: explain the live project using memory as orientation, not as a substitute for inspection.
 
+## Context Pack
+
+Long conversations are handled by a default `ContextPackExtension`. It keeps raw long outputs in a local `.coding-agent/context-outputs/` store, puts only a compact summary and `output_id` into the model context, and registers `read_context_output` so the model can fetch exact line ranges when needed. When a model request grows beyond roughly 40,000 characters, it also replaces older assistant/tool-call exchanges with structured `<compacted_history>` summaries.
+
+The older v2/v3 single-task context manager and read cache experiments have been removed. Context packing changes the request copy sent to the model and offloads oversized tool outputs, but the exact long output remains recoverable by id for diagnosis and re-summary.
+
 ## Extensions
 
-The agent exposes lifecycle hooks in `src/coding_agent/extensions.py` so new framework behavior can be added without editing the core loop. Extensions can inject context, add tool definitions, observe LLM calls, intercept or implement tool calls, and save state at session end. Project memory and skill selection are now ordinary extensions.
+The agent exposes lifecycle hooks in `src/coding_agent/extensions.py` so new framework behavior can be added without editing the core loop. Extensions can inject context, add tool definitions, observe LLM calls, subscribe to context compaction, intercept or implement tool calls, and save state at session end. Project memory, skill selection, and context packing are now ordinary extensions.

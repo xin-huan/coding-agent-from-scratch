@@ -35,6 +35,15 @@ class InvalidCompletions(FakeCompletions):
         return response
 
 
+class TrailingTextCompletions(FakeCompletions):
+    def create(self, **request: object) -> object:
+        response = super().create(**request)
+        response.choices[0].message.tool_calls[0].function.arguments = (
+            '{"path":"README.md"}\nextra commentary'
+        )
+        return response
+
+
 class DeepSeekModelTests(unittest.TestCase):
     def test_converts_provider_tool_call_to_agent_format(self) -> None:
         completions = FakeCompletions()
@@ -51,6 +60,15 @@ class DeepSeekModelTests(unittest.TestCase):
         self.assertEqual(reply.usage.completion_tokens, 30)
         self.assertEqual(reply.usage.cache_hit_tokens, 40)
         self.assertIn("tools", completions.request)
+
+    def test_recovers_first_tool_argument_object_with_trailing_text(self) -> None:
+        completions = TrailingTextCompletions()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        model = DeepSeekModel(Settings(api_key="test-secret"), client=client)
+
+        reply = model.complete([], [{"type": "function"}])
+
+        self.assertEqual(reply.tool_calls[0].arguments, {"path": "README.md"})
 
     def test_omits_tools_from_a_finalization_request(self) -> None:
         completions = FakeCompletions()

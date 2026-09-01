@@ -64,4 +64,13 @@ def _sanitize(value: Any, field_name: str = "") -> Any:
         return {key: _sanitize(item, str(key)) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value]
+    if isinstance(value, str):
+        return _clean_string(value)
     return value
+
+
+def _clean_string(value: str) -> str:
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in value
+    )

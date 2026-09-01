@@ -10,6 +10,7 @@ from typing import Callable, Protocol, Sequence
 from coding_agent.checkpoint import CheckpointError, CheckpointStore
 from coding_agent.extensions import (
     AgentExtension,
+    ContextPackExtension,
     ExtensionContext,
     ExtensionManager,
     ProjectMemoryExtension,
@@ -225,6 +226,7 @@ class TaskState:
     changes_pending_verification: bool = False
     implementation_changes_pending: bool = False
     full_tests_passed: bool = False
+    usage_documentation_seen: bool = False
     plan: list[str] = field(default_factory=list)
     acceptance: list[str] = field(default_factory=list)
     test_strategy: str = "not planned"
@@ -254,7 +256,9 @@ class TaskState:
             missing.append("entry point")
         if not any(_is_test_path(path) for path in paths):
             missing.append("automated tests")
-        if not any(path.rsplit("/", 1)[-1].startswith("readme") for path in paths):
+        if not any(_is_usage_doc_path(path) for path in paths) and not (
+            self.usage_documentation_seen
+        ):
             missing.append("usage documentation")
         return missing
 
@@ -266,6 +270,9 @@ class TaskState:
 
         if call.name in {"write_file", "apply_patch"}:
             path = str(call.arguments.get("path", "unknown"))
+            content = _changed_content(call)
+            if _is_usage_doc_path(path) or _contains_usage_documentation(content):
+                self.usage_documentation_seen = True
             if path not in self.modified_files:
                 self.modified_files.append(path)
             self.changes_pending_verification = True
@@ -366,6 +373,7 @@ class TaskState:
             "changes_pending_verification": self.changes_pending_verification,
             "implementation_changes_pending": self.implementation_changes_pending,
             "full_tests_passed": self.full_tests_passed,
+            "usage_documentation_seen": self.usage_documentation_seen,
             "plan": self.plan,
             "acceptance": self.acceptance,
             "test_strategy": self.test_strategy,
@@ -402,6 +410,9 @@ class TaskState:
                 data.get("implementation_changes_pending", False)
             ),
             full_tests_passed=bool(data.get("full_tests_passed", False)),
+            usage_documentation_seen=bool(
+                data.get("usage_documentation_seen", False)
+            ),
             plan=plan,
             acceptance=acceptance,
             test_strategy=str(data.get("test_strategy", "not planned")),
@@ -430,6 +441,39 @@ def _is_test_path(path: str) -> bool:
 def _is_entry_point(path: str) -> bool:
     name = path.replace("\\", "/").casefold().rsplit("/", 1)[-1]
     return name in {"main.py", "__main__.py", "app.py"}
+
+
+def _is_usage_doc_path(path: str) -> bool:
+    name = path.replace("\\", "/").casefold().rsplit("/", 1)[-1]
+    return name.startswith("readme") or name in {"usage.md", "docs.md"}
+
+
+def _changed_content(call: ToolCall) -> str:
+    if call.name == "write_file":
+        return str(call.arguments.get("content", ""))
+    if call.name == "apply_patch":
+        return str(call.arguments.get("new_text", ""))
+    return ""
+
+
+def _contains_usage_documentation(content: str) -> bool:
+    normalized = " ".join(content.casefold().split())
+    if not normalized:
+        return False
+    launch_command = re.search(r"\bpython(?:\.exe)?\s+[\w./\\-]+\.py\b", normalized)
+    usage_word = any(
+        marker in normalized
+        for marker in (
+            "usage",
+            "how to run",
+            "run with",
+            "launch",
+            "启动",
+            "运行",
+            "使用",
+        )
+    )
+    return launch_command is not None and usage_word
 
 
 def _is_full_test_command(call: ToolCall) -> bool:
@@ -524,6 +568,7 @@ class Agent:
         memory_store: ProjectMemoryStore | None = None,
         skill_registry: SkillRegistry | None = None,
         extensions: Sequence[AgentExtension] = (),
+        context_pack: ContextPackExtension | None = None,
     ) -> None:
         self.model = model
         self.workspace = workspace
@@ -539,6 +584,7 @@ class Agent:
             SkillSelectionExtension(skill_registry or SkillRegistry.load_builtin())
         )
         configured_extensions.extend(extensions)
+        configured_extensions.append(context_pack or ContextPackExtension())
         self.extensions = ExtensionManager(configured_extensions)
         self._extension_context: ExtensionContext | None = None
         self._pending_task: str | None = None

@@ -37,6 +37,18 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(record["data"]["completion_tokens"], 30)
             self.assertEqual(record["data"]["access_token"], "[REDACTED]")
 
+    def test_replaces_invalid_unicode_surrogates_before_writing_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "trace.jsonl"
+            trace = JsonlTrace(path)
+
+            trace.record("task_start", task="bad\udcaa input")
+
+            content = path.read_text(encoding="utf-8")
+            record = json.loads(content)
+            self.assertEqual(record["data"]["task"], "bad\ufffd input")
+            self.assertNotIn("\udcaa", content)
+
 
 if __name__ == "__main__":
     unittest.main()
