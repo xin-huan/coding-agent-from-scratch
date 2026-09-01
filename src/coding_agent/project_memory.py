@@ -56,6 +56,7 @@ class ProjectMemory:
     workspace: str
     project_id: str
     display_name: str = ""
+    sort_order: int = 0
     structure: list[str] = field(default_factory=list)
     user_decisions: list[str] = field(default_factory=list)
     launch_commands: list[str] = field(default_factory=list)
@@ -68,6 +69,7 @@ class ProjectMemory:
             "workspace": self.workspace,
             "project_id": self.project_id,
             "display_name": self.display_name,
+            "sort_order": self.sort_order,
             "structure": self.structure,
             "user_decisions": self.user_decisions,
             "launch_commands": self.launch_commands,
@@ -88,6 +90,7 @@ class ProjectMemory:
             workspace=str(data.get("workspace", workspace)),
             project_id=str(data.get("project_id", project_id)),
             display_name=str(data.get("display_name", "")),
+            sort_order=_int_value(data.get("sort_order", 0)),
             structure=_string_list(data.get("structure")),
             user_decisions=_string_list(data.get("user_decisions")),
             launch_commands=_string_list(data.get("launch_commands")),
@@ -146,6 +149,24 @@ class ProjectMemoryStore:
                 self.save(memory)
                 return memory
         raise KeyError(f"Project not found: {project_id}")
+
+    def delete_project(self, project_id: str) -> None:
+        path = self.directory / f"{project_id}.json"
+        if not path.exists():
+            raise KeyError(f"Project not found: {project_id}")
+        path.unlink()
+
+    def reorder_projects(self, project_ids: list[str]) -> list[ProjectMemory]:
+        projects = self.list_projects()
+        by_id = {project.project_id: project for project in projects}
+        ordered_ids = [project_id for project_id in project_ids if project_id in by_id]
+        ordered_ids.extend(project.project_id for project in projects if project.project_id not in ordered_ids)
+        for index, project_id in enumerate(ordered_ids):
+            memory = by_id[project_id]
+            memory.sort_order = index
+            memory.updated_at = _now()
+            self.save(memory)
+        return self.list_projects()
 
     def update_after_task(
         self,
@@ -240,7 +261,7 @@ class ProjectMemoryStore:
                     project_id=project_id,
                 )
             )
-        return projects
+        return sorted(projects, key=lambda item: (item.sort_order, item.display_name.casefold(), item.workspace.casefold()))
 
 
 def snapshot_structure(workspace: Workspace) -> list[str]:
@@ -308,6 +329,13 @@ def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value]
+
+
+def _int_value(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _compact(text: str, limit: int) -> str:

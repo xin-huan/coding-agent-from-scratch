@@ -17,7 +17,7 @@ Run the minimal local chat UI:
 
 Then open `http://127.0.0.1:8765`.
 
-Project memory and chat history are saved under `.coding-agent/` in the directory where the agent is launched. The memory stores project structure, user decisions, known launch commands, and historical task summaries.
+Project memory, chat history, long context outputs, and workspace snapshots are saved under `.coding-agent/` in the directory where the agent is launched. The memory stores project structure, user decisions, known launch commands, and historical task summaries.
 
 ## Skills
 
@@ -49,4 +49,6 @@ The default `SubAgentExtension` enables `delegate_subagent` only when the reques
 
 ## Tree Sessions
 
-Chat history is stored as a message tree instead of only a flat list. Each message has an `id` and `parent_id`, and each conversation tracks `current_message_id`. The UI renders the current branch as normal chat while preserving the full `message_tree`, so users can jump back to an earlier node and continue a new branch without deleting the old attempt.
+Chat history is stored as a message tree instead of only a flat list. Each message has an `id` and `parent_id`, and each conversation tracks `current_message_id`. The UI renders the current branch as normal chat while the Session tree shows all user-turn nodes as a history directory. Left-clicking a node only scrolls to the user request when it is visible; right-clicking opens explicit actions such as continuing from that turn. Normal linear history stays aligned on one vertical line, while real sibling branches are indented.
+
+When an Agent run changes text files, the chat UI also stores a lightweight workspace snapshot under `.coding-agent/workspace-snapshots/` and binds it to that turn. Restoring code is always explicit: right-click a turn, choose restore snapshot, confirm the warning, then the current related files are backed up before restoration.

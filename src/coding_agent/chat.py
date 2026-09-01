@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -21,6 +23,10 @@ from coding_agent.model import DeepSeekModel, ModelError
 from coding_agent.project_memory import ProjectMemoryStore, snapshot_structure
 from coding_agent.trace import JsonlTrace
 from coding_agent.workspace import Workspace, WorkspaceError
+from coding_agent.workspace_snapshot import (
+    WorkspaceSnapshotError,
+    WorkspaceSnapshotStore,
+)
 
 
 @dataclass
@@ -31,6 +37,7 @@ class ChatMessage:
     created_at: str = ""
     id: str = ""
     parent_id: str = ""
+    workspace_snapshot_id: str = ""
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -40,6 +47,7 @@ class ChatMessage:
             "content": self.content,
             "events": self.events,
             "created_at": self.created_at,
+            "workspace_snapshot_id": self.workspace_snapshot_id,
         }
 
     @classmethod
@@ -56,6 +64,7 @@ class ChatMessage:
             created_at=str(data.get("created_at", "")),
             id=str(data.get("id", "")),
             parent_id=str(data.get("parent_id", "")),
+            workspace_snapshot_id=str(data.get("workspace_snapshot_id", "")),
         )
 
 
@@ -114,6 +123,12 @@ class Conversation:
 
     def contains_message(self, message_id: str) -> bool:
         return any(message.id == message_id for message in self.messages)
+
+    def message_by_id(self, message_id: str) -> ChatMessage:
+        for message in self.messages:
+            if message.id == message_id:
+                return message
+        raise KeyError(f"Message not found: {message_id}")
 
     @classmethod
     def from_data(cls, data: object) -> "Conversation | None":
@@ -213,6 +228,18 @@ class ChatStore:
         del self.conversations[conversation_id]
         self.save()
 
+    def delete_project_conversations(self, project_id: str) -> list[str]:
+        deleted = [
+            conversation_id
+            for conversation_id, conversation in self.conversations.items()
+            if conversation.project_id == project_id
+        ]
+        for conversation_id in deleted:
+            del self.conversations[conversation_id]
+        if deleted:
+            self.save()
+        return deleted
+
     def checkout_message(self, conversation_id: str, message_id: str) -> Conversation:
         conversation = self.get(conversation_id)
         if message_id and not conversation.contains_message(message_id):
@@ -256,6 +283,7 @@ class ChatStore:
         content: str,
         events: list[str],
         parent_id: str | None = None,
+        workspace_snapshot_id: str = "",
     ) -> ChatMessage:
         conversation = self.get(conversation_id)
         resolved_parent_id = conversation.current_message_id if parent_id is None else parent_id
@@ -269,10 +297,24 @@ class ChatStore:
             created_at=now,
             id=uuid4().hex,
             parent_id=resolved_parent_id or "",
+            workspace_snapshot_id=workspace_snapshot_id,
         )
         conversation.messages.append(message)
         conversation.current_message_id = message.id
         conversation.updated_at = now
+        self.save()
+        return message
+
+    def set_message_snapshot(
+        self,
+        conversation_id: str,
+        message_id: str,
+        snapshot_id: str,
+    ) -> ChatMessage:
+        conversation = self.get(conversation_id)
+        message = conversation.message_by_id(message_id)
+        message.workspace_snapshot_id = snapshot_id
+        conversation.updated_at = _now()
         self.save()
         return message
 
@@ -335,6 +377,7 @@ class ChatApp:
         self.settings = settings
         self.memory_store = ProjectMemoryStore(data_dir / "project-memory")
         self.chat_store = ChatStore(data_dir / "chat-ui" / "conversations.json")
+        self.snapshot_store = WorkspaceSnapshotStore(data_dir / "workspace-snapshots")
         self._agents: dict[str, Agent] = {}
         self._running_conversations: dict[str, RunningConversation] = {}
         self._lock = RLock()
@@ -347,6 +390,7 @@ class ChatApp:
                     "id": memory.project_id,
                     "workspace": memory.workspace,
                     "display_name": memory.display_name,
+                    "sort_order": memory.sort_order,
                     "updated_at": memory.updated_at,
                 }
                 for memory in self.memory_store.list_projects()
@@ -367,10 +411,15 @@ class ChatApp:
 
     def add_project(self, path: str) -> dict[str, object]:
         workspace = Workspace(Path(path))
+        memory_path = self.memory_store.path_for(workspace)
+        is_new_project = not memory_path.exists()
         memory = self.memory_store.load(workspace)
         memory.workspace = str(workspace.root)
         if not memory.display_name:
             memory.display_name = workspace.root.name or str(workspace.root)
+        if is_new_project:
+            projects = self.memory_store.list_projects()
+            memory.sort_order = max((project.sort_order for project in projects), default=-1) + 1
         memory.structure = snapshot_structure(workspace)
         memory.updated_at = _now()
         self.memory_store.save(memory)
@@ -394,6 +443,45 @@ class ChatApp:
             "workspace": memory.workspace,
             "display_name": memory.display_name,
             "updated_at": memory.updated_at,
+        }
+
+    def delete_project(self, project_id: str) -> dict[str, object]:
+        with self._lock:
+            conversations = [
+                conversation
+                for conversation in self.chat_store.list_conversations()
+                if conversation.project_id == project_id
+            ]
+            running = [
+                conversation.id
+                for conversation in conversations
+                if conversation.id in self._running_conversations
+            ]
+            if running:
+                raise RuntimeError("Cannot delete a project while its conversation is running")
+            deleted_conversations = self.chat_store.delete_project_conversations(project_id)
+            for conversation_id in deleted_conversations:
+                self._agents.pop(conversation_id, None)
+            self.memory_store.delete_project(project_id)
+        return {
+            "deleted": project_id,
+            "deleted_conversations": deleted_conversations,
+        }
+
+    def reorder_projects(self, project_ids: list[str]) -> dict[str, object]:
+        with self._lock:
+            projects = self.memory_store.reorder_projects(project_ids)
+        return {
+            "projects": [
+                {
+                    "id": memory.project_id,
+                    "workspace": memory.workspace,
+                    "display_name": memory.display_name,
+                    "sort_order": memory.sort_order,
+                    "updated_at": memory.updated_at,
+                }
+                for memory in projects
+            ]
         }
 
     def create_conversation(self, project_id: str, title: str = "新对话") -> dict[str, object]:
@@ -429,10 +517,35 @@ class ChatApp:
             self._agents.pop(conversation_id, None)
         return {"deleted": conversation_id}
 
+    def restore_workspace_snapshot(
+        self,
+        conversation_id: str,
+        snapshot_id: str,
+    ) -> dict[str, object]:
+        with self._lock:
+            if conversation_id in self._running_conversations:
+                raise RuntimeError("Cannot restore code while a conversation is running")
+            conversation = self.chat_store.get(conversation_id)
+            matching_message = next(
+                (
+                    message
+                    for message in conversation.messages
+                    if message.workspace_snapshot_id == snapshot_id
+                ),
+                None,
+            )
+            if matching_message is None:
+                raise WorkspaceSnapshotError("Snapshot does not belong to this conversation")
+            workspace = Workspace(Path(self._workspace_for_project(conversation.project_id)))
+            result = self.snapshot_store.restore(workspace, snapshot_id, created_at=_now())
+            self._agents.pop(conversation_id, None)
+        return result.to_data()
+
     def send_message(self, conversation_id: str, content: str) -> dict[str, object]:
         conversation = self.chat_store.get(conversation_id)
         workspace_path = self._workspace_for_project(conversation.project_id)
         workspace = Workspace(Path(workspace_path))
+        before_state = self.snapshot_store.capture_state(workspace)
         events: list[str] = []
         user_message = self.chat_store.append_user_message(conversation.id, content)
         self._running_conversations[conversation.id] = RunningConversation(
@@ -458,11 +571,20 @@ class ChatApp:
             answer = f"任务失败: {error}"
         finally:
             self._running_conversations.pop(conversation.id, None)
-        self.chat_store.append_assistant_message(
+        assistant_message = self.chat_store.append_assistant_message(
             conversation.id,
             content=answer,
             events=events,
             parent_id=user_message.id,
+        )
+        self._capture_workspace_snapshot(
+            workspace,
+            before_state=before_state,
+            conversation_id=conversation.id,
+            project_id=conversation.project_id,
+            assistant_message_id=assistant_message.id,
+            user_message_id=user_message.id,
+            created_at=assistant_message.created_at,
         )
         saved = self.chat_store.get(conversation.id)
         return {
@@ -529,6 +651,7 @@ class ChatApp:
 
         try:
             workspace = Workspace(Path(workspace_path))
+            before_state = self.snapshot_store.capture_state(workspace)
             with self._lock:
                 agent = self._agents.get(conversation_id)
                 if agent is None:
@@ -543,13 +666,54 @@ class ChatApp:
             answer = f"任务失败: {error}"
         finally:
             with self._lock:
-                self.chat_store.append_assistant_message(
+                assistant_message = self.chat_store.append_assistant_message(
                     conversation_id,
                     content=answer,
                     events=events,
                     parent_id=user_message_id,
                 )
+                conversation = self.chat_store.get(conversation_id)
+                if "workspace" in locals() and "before_state" in locals():
+                    self._capture_workspace_snapshot(
+                        workspace,
+                        before_state=before_state,
+                        conversation_id=conversation_id,
+                        project_id=conversation.project_id,
+                        assistant_message_id=assistant_message.id,
+                        user_message_id=user_message_id,
+                        created_at=assistant_message.created_at,
+                    )
                 self._running_conversations.pop(conversation_id, None)
+
+    def _capture_workspace_snapshot(
+        self,
+        workspace: Workspace,
+        *,
+        before_state: dict[str, str],
+        conversation_id: str,
+        project_id: str,
+        assistant_message_id: str,
+        user_message_id: str,
+        created_at: str,
+    ) -> str:
+        after_state = self.snapshot_store.capture_state(workspace)
+        snapshot = self.snapshot_store.create_for_changes(
+            before=before_state,
+            after=after_state,
+            project_id=project_id,
+            conversation_id=conversation_id,
+            message_id=assistant_message_id,
+            user_message_id=user_message_id,
+            created_at=created_at,
+        )
+        if snapshot is None:
+            return ""
+        self.chat_store.set_message_snapshot(
+            conversation_id,
+            assistant_message_id,
+            snapshot.id,
+        )
+        return snapshot.id
 
     def _create_agent(
         self,
@@ -621,6 +785,15 @@ def make_handler(app: ChatApp) -> type[BaseHTTPRequestHandler]:
                         str(payload.get("project_id", "")),
                         str(payload.get("display_name", "")),
                     )
+                elif parsed.path == "/api/projects/delete":
+                    result = app.delete_project(
+                        str(payload.get("project_id", "")),
+                    )
+                elif parsed.path == "/api/projects/reorder":
+                    project_ids = payload.get("project_ids", [])
+                    if not isinstance(project_ids, list):
+                        raise ValueError("project_ids must be a list")
+                    result = app.reorder_projects([str(item) for item in project_ids])
                 elif parsed.path == "/api/conversations":
                     result = app.create_conversation(
                         str(payload.get("project_id", "")),
@@ -645,6 +818,11 @@ def make_handler(app: ChatApp) -> type[BaseHTTPRequestHandler]:
                         str(payload.get("conversation_id", "")),
                         str(payload.get("message_id", "")),
                     )
+                elif parsed.path == "/api/conversations/restore-snapshot":
+                    result = app.restore_workspace_snapshot(
+                        str(payload.get("conversation_id", "")),
+                        str(payload.get("snapshot_id", "")),
+                    )
                 elif parsed.path == "/api/messages":
                     result = app.start_message(
                         str(payload.get("conversation_id", "")),
@@ -654,7 +832,13 @@ def make_handler(app: ChatApp) -> type[BaseHTTPRequestHandler]:
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
-            except (KeyError, RuntimeError, ValueError, WorkspaceError) as error:
+            except (
+                KeyError,
+                RuntimeError,
+                ValueError,
+                WorkspaceError,
+                WorkspaceSnapshotError,
+            ) as error:
                 self._send_json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(result)
@@ -708,20 +892,104 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _choose_directory() -> str:
+    errors: list[str] = []
+    child_code = (
+        "import sys\n"
+        "try:\n"
+        "    import tkinter as tk\n"
+        "    from tkinter import filedialog\n"
+        "    root = tk.Tk()\n"
+        "    root.withdraw()\n"
+        "    root.attributes('-topmost', True)\n"
+        "    root.lift()\n"
+        "    root.update()\n"
+        "    selected = filedialog.askdirectory(parent=root, title='选择项目文件夹', mustexist=True)\n"
+        "    root.destroy()\n"
+        "    sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
+        "    print(selected or '', flush=True)\n"
+        "except Exception as error:\n"
+        "    print(f'ERROR: {error}', file=sys.stderr, flush=True)\n"
+        "    raise\n"
+    )
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except ImportError as error:
-        raise RuntimeError("Directory picker is not available") from error
+        result = subprocess.run(
+            [sys.executable, "-c", child_code],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        errors.append(f"python-tk: {result.stderr.strip() or result.returncode}")
+    except Exception as error:
+        errors.append(f"python-tk: {error}")
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    try:
-        selected = filedialog.askdirectory(title="选择项目文件夹")
-    finally:
-        root.destroy()
-    return selected
+    powershell = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    if powershell.exists():
+        shell_script = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+            "$shell = New-Object -ComObject Shell.Application;"
+            "$folder = $shell.BrowseForFolder(0, '选择项目文件夹', 0x41, 17);"
+            "if ($folder -ne $null) { Write-Output $folder.Self.Path }"
+        )
+        try:
+            result = subprocess.run(
+                [str(powershell), "-NoProfile", "-STA", "-Command", shell_script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                check=False,
+            )
+            if result.returncode == 0:
+                selected = result.stdout.strip()
+                if selected:
+                    return selected
+                return ""
+            errors.append(f"shell: {result.stderr.strip() or result.returncode}")
+        except Exception as error:
+            errors.append(f"shell: {error}")
+
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$owner = New-Object System.Windows.Forms.Form;"
+            "$owner.TopMost = $true;"
+            "$owner.ShowInTaskbar = $false;"
+            "$owner.StartPosition = 'CenterScreen';"
+            "$owner.Width = 1;"
+            "$owner.Height = 1;"
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "$dialog.Description = '选择项目文件夹';"
+            "$dialog.ShowNewFolderButton = $true;"
+            "$owner.Show();"
+            "$result = $dialog.ShowDialog($owner);"
+            "$owner.Dispose();"
+            "if ($result -eq [System.Windows.Forms.DialogResult]::OK) {"
+            "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+            "  Write-Output $dialog.SelectedPath"
+            "}"
+        )
+        try:
+            result = subprocess.run(
+                [str(powershell), "-NoProfile", "-STA", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            errors.append(f"powershell: {result.stderr.strip() or result.returncode}")
+        except Exception as error:
+            errors.append(f"powershell: {error}")
+
+    raise RuntimeError("Directory picker is not available: " + "; ".join(errors))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -777,7 +1045,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .app {
       display: grid;
-      grid-template-columns: 320px minmax(0, 1fr);
+      grid-template-columns: var(--sidebar-width, 320px) 6px minmax(0, 1fr);
       height: 100vh;
     }
     aside {
@@ -871,7 +1139,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .project-row {
       display: grid;
-      grid-template-columns: auto minmax(0, 1fr) auto auto;
+      grid-template-columns: auto minmax(0, 1fr) auto auto auto;
       gap: 6px;
       align-items: center;
       width: 100%;
@@ -884,6 +1152,12 @@ INDEX_HTML = r"""<!doctype html>
     .project-row.active {
       background: #edf7f5;
       border-color: #b8dcd7;
+    }
+    .project-group.dragging {
+      opacity: .5;
+    }
+    .project-group.drop-target .project-row {
+      border-top-color: var(--accent);
     }
     .project-toggle,
     .project-name {
@@ -917,6 +1191,7 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--accent-strong);
       background: #fff;
     }
+    .project-action.danger:hover,
     .conversation-action.danger:hover {
       color: #b42318;
     }
@@ -987,8 +1262,30 @@ INDEX_HTML = r"""<!doctype html>
     }
     .conversation-body {
       display: grid;
-      grid-template-columns: 180px minmax(0, 1fr);
+      grid-template-columns: var(--nav-width, 180px) 6px minmax(0, 1fr);
       min-height: 0;
+    }
+    .resize-handle {
+      background: transparent;
+      position: relative;
+      z-index: 5;
+    }
+    .resize-handle.vertical {
+      cursor: col-resize;
+    }
+    .resize-handle.vertical::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 2px;
+      width: 1px;
+      background: var(--line);
+    }
+    .resize-handle:hover::after,
+    body.resizing .resize-handle::after {
+      background: var(--accent);
+      width: 2px;
     }
     .day-nav {
       border-right: 1px solid var(--line);
@@ -1028,6 +1325,9 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       gap: 3px;
     }
+    .tree-entry {
+      margin-left: var(--tree-indent, 0px);
+    }
     .tree-node {
       width: 100%;
       border: 0;
@@ -1039,6 +1339,7 @@ INDEX_HTML = r"""<!doctype html>
       text-align: left;
       font-size: 12px;
       line-height: 1.3;
+      position: relative;
     }
     .tree-node.on-path {
       color: var(--text);
@@ -1049,6 +1350,20 @@ INDEX_HTML = r"""<!doctype html>
       border-left-color: var(--accent);
       background: #edf7f5;
     }
+    .tree-node::before {
+      content: "";
+      position: absolute;
+      left: -2px;
+      top: -3px;
+      bottom: -3px;
+      border-left: 2px solid var(--line);
+    }
+    .tree-node.on-path::before {
+      border-left-color: #c7d7d4;
+    }
+    .tree-node.active::before {
+      border-left-color: var(--accent);
+    }
     .tree-label {
       display: block;
       overflow: hidden;
@@ -1058,6 +1373,61 @@ INDEX_HTML = r"""<!doctype html>
     .branch-count {
       color: var(--accent-strong);
       font-size: 11px;
+    }
+    .snapshot-badge {
+      color: var(--accent-strong);
+      font-size: 11px;
+      margin-left: 4px;
+    }
+    .turn-menu {
+      position: fixed;
+      z-index: 20;
+      display: grid;
+      gap: 6px;
+      min-width: 132px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, .16);
+    }
+    .turn-menu[hidden] {
+      display: none;
+    }
+    .turn-menu-title {
+      max-width: 220px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 0 2px 2px;
+    }
+    .turn-menu-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .turn-action {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 6px 9px;
+      font-size: 12px;
+    }
+    .turn-action.primary {
+      border-color: var(--accent);
+      color: var(--accent-strong);
+    }
+    .turn-action:disabled {
+      color: var(--muted);
+      background: #f3f6f5;
+      cursor: not-allowed;
+    }
+    .tree-node:hover {
+      color: var(--accent-strong);
+      border-left-color: var(--accent);
     }
     .day-separator {
       max-width: 900px;
@@ -1075,6 +1445,7 @@ INDEX_HTML = r"""<!doctype html>
       padding: 12px 14px;
       background: var(--assistant);
       line-height: 1.5;
+      scroll-margin-top: 16px;
     }
     .message-content {
       overflow-wrap: anywhere;
@@ -1188,6 +1559,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     @media (max-width: 820px) {
       .app { grid-template-columns: 1fr; }
+      .app-resizer,
+      .nav-resizer { display: none; }
       aside {
         height: 42vh;
         border-right: 0;
@@ -1222,6 +1595,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="projectTree"></div>
       </div>
     </aside>
+    <div class="resize-handle vertical app-resizer" id="appResizer" title="拖动调整项目栏宽度"></div>
     <main>
       <header>
         <div class="title" id="conversationTitle">未选择对话</div>
@@ -1229,6 +1603,7 @@ INDEX_HTML = r"""<!doctype html>
       </header>
       <div class="conversation-body">
         <nav class="day-nav" id="dayNav" aria-label="聊天日期目录"></nav>
+        <div class="resize-handle vertical nav-resizer" id="navResizer" title="拖动调整目录宽度"></div>
         <div class="messages" id="messages"></div>
       </div>
       <form class="composer" id="composer">
@@ -1237,6 +1612,7 @@ INDEX_HTML = r"""<!doctype html>
       </form>
     </main>
   </div>
+  <div class="turn-menu" id="turnMenu" hidden></div>
   <script>
     const state = {
       projects: [],
@@ -1248,6 +1624,76 @@ INDEX_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const pendingStarted = {};
     const expandedProjects = new Set();
+    let turnMenuState = null;
+    let draggedProjectId = "";
+    let projectsInitialized = false;
+    const layoutKeys = {
+      sidebar: "coding-agent.sidebar-width",
+      nav: "coding-agent.nav-width",
+    };
+
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
+    function loadLayout() {
+      const sidebar = Number(localStorage.getItem(layoutKeys.sidebar));
+      const nav = Number(localStorage.getItem(layoutKeys.nav));
+      if (Number.isFinite(sidebar) && sidebar > 0) {
+        document.documentElement.style.setProperty("--sidebar-width", `${clamp(sidebar, 240, 520)}px`);
+      }
+      if (Number.isFinite(nav) && nav > 0) {
+        document.documentElement.style.setProperty("--nav-width", `${clamp(nav, 120, 380)}px`);
+      }
+    }
+
+    function setupResizer(handleId, options) {
+      const handle = $(handleId);
+      if (!handle) return;
+      handle.addEventListener("pointerdown", (event) => {
+        if (window.matchMedia("(max-width: 820px)").matches) return;
+        event.preventDefault();
+        handle.setPointerCapture(event.pointerId);
+        document.body.classList.add("resizing");
+        const startX = event.clientX;
+        const startWidth = options.currentWidth();
+
+        function move(moveEvent) {
+          const nextWidth = clamp(startWidth + moveEvent.clientX - startX, options.min(), options.max());
+          document.documentElement.style.setProperty(options.cssVariable, `${nextWidth}px`);
+          localStorage.setItem(options.storageKey, String(Math.round(nextWidth)));
+        }
+
+        function finish(upEvent) {
+          document.body.classList.remove("resizing");
+          handle.releasePointerCapture(upEvent.pointerId);
+          handle.removeEventListener("pointermove", move);
+          handle.removeEventListener("pointerup", finish);
+          handle.removeEventListener("pointercancel", finish);
+        }
+
+        handle.addEventListener("pointermove", move);
+        handle.addEventListener("pointerup", finish);
+        handle.addEventListener("pointercancel", finish);
+      });
+    }
+
+    function setupResizers() {
+      setupResizer("appResizer", {
+        cssVariable: "--sidebar-width",
+        storageKey: layoutKeys.sidebar,
+        currentWidth: () => document.querySelector("aside").getBoundingClientRect().width,
+        min: () => 240,
+        max: () => Math.max(260, window.innerWidth - 520),
+      });
+      setupResizer("navResizer", {
+        cssVariable: "--nav-width",
+        storageKey: layoutKeys.nav,
+        currentWidth: () => $("dayNav").getBoundingClientRect().width,
+        min: () => 120,
+        max: () => Math.min(420, Math.max(160, window.innerWidth - 520)),
+      });
+    }
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
@@ -1264,7 +1710,10 @@ INDEX_HTML = r"""<!doctype html>
       state.projects = data.projects || [];
       state.conversations = data.conversations || [];
       state.running = data.running_conversations || {};
-      state.projects.forEach((project) => expandedProjects.add(project.id));
+      if (!projectsInitialized) {
+        state.projects.forEach((project) => expandedProjects.add(project.id));
+        projectsInitialized = true;
+      }
       reconcileSelection();
       render();
     }
@@ -1335,12 +1784,13 @@ INDEX_HTML = r"""<!doctype html>
             }</div>`
           : "";
         return `
-          <div class="project-group">
+          <div class="project-group" draggable="true" data-project-drag-id="${project.id}">
             <div class="project-row${active}">
               <button class="project-toggle" data-toggle-project="${project.id}" title="${expanded ? "收起项目" : "展开项目"}">${expanded ? "v" : ">"}</button>
               <button class="project-name" data-project-id="${project.id}" title="${escapeHtml(project.workspace)}">${escapeHtml(projectLabel(project))}</button>
               <button class="project-action" data-project-rename-id="${project.id}" title="重命名项目">改</button>
               <button class="project-action" data-project-new-id="${project.id}" title="新建对话">+</button>
+              <button class="project-action danger" data-project-delete-id="${project.id}" title="移除项目">删</button>
             </div>
             ${conversationList}
           </div>`;
@@ -1364,13 +1814,26 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     $("browseProject").onclick = async () => {
-      const project = await api("/api/projects/pick", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      state.projectId = project.id;
-      state.conversationId = "";
-      await loadState();
+      const button = $("browseProject");
+      const previousText = button.textContent;
+      button.disabled = true;
+      button.textContent = "选择中...";
+      try {
+        const project = await api("/api/projects/pick", {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        state.projectId = project.id;
+        state.conversationId = "";
+        expandedProjects.add(project.id);
+        hideTurnMenu();
+        await loadState();
+      } catch (error) {
+        alert(`选择项目失败: ${error.message}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = previousText;
+      }
     };
 
     $("addProject").onclick = async () => {
@@ -1382,6 +1845,8 @@ INDEX_HTML = r"""<!doctype html>
       });
       state.projectId = project.id;
       state.conversationId = "";
+      expandedProjects.add(project.id);
+      hideTurnMenu();
       await loadState();
     };
 
@@ -1395,7 +1860,7 @@ INDEX_HTML = r"""<!doctype html>
         const projectId = toggle.dataset.toggleProject;
         if (expandedProjects.has(projectId)) expandedProjects.delete(projectId);
         else expandedProjects.add(projectId);
-        selectProject(projectId);
+        focusProject(projectId);
         return;
       }
 
@@ -1414,6 +1879,12 @@ INDEX_HTML = r"""<!doctype html>
       const projectNew = event.target.closest("button[data-project-new-id]");
       if (projectNew) {
         await createConversationForProject(projectNew.dataset.projectNewId);
+        return;
+      }
+
+      const projectDelete = event.target.closest("button[data-project-delete-id]");
+      if (projectDelete) {
+        await deleteProject(projectDelete.dataset.projectDeleteId);
         return;
       }
 
@@ -1441,15 +1912,82 @@ INDEX_HTML = r"""<!doctype html>
       if (!conversation) return;
       state.projectId = conversation.project_id;
       state.conversationId = conversation.id;
+      hideTurnMenu();
       expandedProjects.add(conversation.project_id);
       render();
     };
 
+    $("projectTree").addEventListener("dragstart", (event) => {
+      const group = event.target.closest("[data-project-drag-id]");
+      if (!group) return;
+      draggedProjectId = group.dataset.projectDragId || "";
+      group.classList.add("dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", draggedProjectId);
+    });
+
+    $("projectTree").addEventListener("dragover", (event) => {
+      const group = event.target.closest("[data-project-drag-id]");
+      if (!group || !draggedProjectId || group.dataset.projectDragId === draggedProjectId) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      document.querySelectorAll(".project-group.drop-target").forEach((item) => item.classList.remove("drop-target"));
+      group.classList.add("drop-target");
+    });
+
+    $("projectTree").addEventListener("drop", async (event) => {
+      const group = event.target.closest("[data-project-drag-id]");
+      if (!group || !draggedProjectId) return;
+      event.preventDefault();
+      const targetProjectId = group.dataset.projectDragId || "";
+      const rect = group.getBoundingClientRect();
+      const placeAfter = event.clientY > rect.top + rect.height / 2;
+      document.querySelectorAll(".project-group.drop-target").forEach((item) => item.classList.remove("drop-target"));
+      await moveProjectTo(draggedProjectId, targetProjectId, placeAfter);
+      draggedProjectId = "";
+    });
+
+    $("projectTree").addEventListener("dragend", () => {
+      draggedProjectId = "";
+      document.querySelectorAll(".project-group.dragging, .project-group.drop-target").forEach((item) => {
+        item.classList.remove("dragging", "drop-target");
+      });
+    });
+
+    async function moveProjectTo(projectId, targetProjectId, placeAfter = false) {
+      if (!projectId || !targetProjectId || projectId === targetProjectId) return;
+      const ids = state.projects.map((project) => project.id).filter((id) => id !== projectId);
+      const targetIndex = ids.indexOf(targetProjectId);
+      if (targetIndex < 0) return;
+      ids.splice(placeAfter ? targetIndex + 1 : targetIndex, 0, projectId);
+      state.projects = ids
+        .map((id) => state.projects.find((project) => project.id === id))
+        .filter(Boolean);
+      render();
+      const result = await api("/api/projects/reorder", {
+        method: "POST",
+        body: JSON.stringify({ project_ids: ids }),
+      });
+      state.projects = result.projects || state.projects;
+      render();
+    }
+
     function selectProject(projectId) {
       state.projectId = projectId;
+      hideTurnMenu();
       expandedProjects.add(projectId);
       const conversations = conversationsForProject(projectId);
       state.conversationId = conversations[0] ? conversations[0].id : "";
+      render();
+    }
+
+    function focusProject(projectId) {
+      state.projectId = projectId;
+      const conversations = conversationsForProject(projectId);
+      if (!conversations.some((conversation) => conversation.id === state.conversationId)) {
+        state.conversationId = conversations[0] ? conversations[0].id : "";
+      }
+      hideTurnMenu();
       render();
     }
 
@@ -1461,6 +1999,7 @@ INDEX_HTML = r"""<!doctype html>
       });
       state.projectId = projectId;
       state.conversationId = conversation.id;
+      hideTurnMenu();
       expandedProjects.add(projectId);
       await loadState();
     }
@@ -1478,6 +2017,28 @@ INDEX_HTML = r"""<!doctype html>
       const index = state.projects.findIndex((item) => item.id === updated.id);
       if (index >= 0) state.projects[index] = updated;
       state.projectId = updated.id;
+      render();
+    }
+
+    async function deleteProject(projectId) {
+      const project = state.projects.find((item) => item.id === projectId);
+      if (!project) return;
+      const name = projectLabel(project);
+      if (!confirm(`从列表移除项目“${name}”？这只会删除 Agent 的项目记录和对话历史，不会删除磁盘上的项目文件。`)) return;
+      await api("/api/projects/delete", {
+        method: "POST",
+        body: JSON.stringify({ project_id: project.id }),
+      });
+      state.projects = state.projects.filter((item) => item.id !== project.id);
+      state.conversations = state.conversations.filter((item) => item.project_id !== project.id);
+      expandedProjects.delete(project.id);
+      if (state.projectId === project.id) {
+        state.projectId = state.projects[0] ? state.projects[0].id : "";
+        if (state.projectId) expandedProjects.add(state.projectId);
+        const conversations = conversationsForProject(state.projectId);
+        state.conversationId = conversations[0] ? conversations[0].id : "";
+        hideTurnMenu();
+      }
       render();
     }
 
@@ -1535,9 +2096,23 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     $("dayNav").onclick = (event) => {
-      const nodeButton = event.target.closest("button[data-message-checkout]");
+      const continueButton = event.target.closest("button[data-turn-continue]");
+      if (continueButton) {
+        continueFromTurn(continueButton.dataset.turnContinue, continueButton.dataset.turnUser || "");
+        return;
+      }
+      const restoreButton = event.target.closest("button[data-turn-restore]");
+      if (restoreButton) {
+        restoreSnapshotForTurn(
+          restoreButton.dataset.turnRestore || "",
+          restoreButton.dataset.turnLabel || restoreButton.textContent || "这个节点",
+        );
+        return;
+      }
+      const nodeButton = event.target.closest("button[data-turn-select]");
       if (nodeButton) {
-        checkoutMessage(nodeButton.dataset.messageCheckout);
+        hideTurnMenu();
+        scrollToMessage(nodeButton.dataset.turnUser || "");
         return;
       }
       const button = event.target.closest("button[data-day]");
@@ -1546,10 +2121,39 @@ INDEX_HTML = r"""<!doctype html>
       if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
     };
 
+    $("dayNav").addEventListener("contextmenu", (event) => {
+      const nodeButton = event.target.closest("button[data-turn-select]");
+      if (!nodeButton) return;
+      event.preventDefault();
+      openTurnMenu(nodeButton, event.clientX, event.clientY);
+    });
+
+    $("turnMenu").onclick = (event) => {
+      const continueButton = event.target.closest("button[data-turn-continue]");
+      if (continueButton) {
+        continueFromTurn(continueButton.dataset.turnContinue, continueButton.dataset.turnUser || "");
+        return;
+      }
+      const restoreButton = event.target.closest("button[data-turn-restore]");
+      if (restoreButton) {
+        restoreSnapshotForTurn(
+          restoreButton.dataset.turnRestore || "",
+          restoreButton.dataset.turnLabel || restoreButton.textContent || "这个节点",
+        );
+      }
+    };
+
+    document.addEventListener("click", (event) => {
+      if ($("turnMenu").contains(event.target)) return;
+      if (event.target.closest("button[data-turn-select]")) return;
+      hideTurnMenu();
+    });
+
     $("composer").onsubmit = async (event) => {
       event.preventDefault();
       const content = $("messageInput").value.trim();
       if (!content || !state.conversationId) return;
+      const parentMessageId = currentConversation()?.current_message_id || "";
       $("sendButton").disabled = true;
       $("messageInput").value = "";
       resizeComposer();
@@ -1561,7 +2165,7 @@ INDEX_HTML = r"""<!doctype html>
           body: JSON.stringify({
             conversation_id: state.conversationId,
             content,
-            parent_message_id: currentConversation()?.current_message_id || "",
+            parent_message_id: parentMessageId,
           }),
         });
         const updated = result.conversation;
@@ -1639,7 +2243,46 @@ INDEX_HTML = r"""<!doctype html>
       delete state.running[conversationId];
     }
 
-    async function checkoutMessage(messageId) {
+    function openTurnMenu(nodeButton, clientX, clientY) {
+      const conversation = currentConversation();
+      if (!conversation) return;
+      const userId = nodeButton.dataset.turnUser || "";
+      if (!userId) return;
+      turnMenuState = {
+        conversationId: conversation.id,
+        userId,
+        resumeId: nodeButton.dataset.messageCheckout || userId,
+        snapshotId: nodeButton.dataset.snapshotId || "",
+        label: nodeButton.dataset.turnLabel || nodeButton.textContent || "这个节点",
+      };
+      const menu = $("turnMenu");
+      const restoreDisabled = turnMenuState.snapshotId ? "" : " disabled";
+      menu.innerHTML = `
+        <div class="turn-menu-title">${escapeHtml(turnMenuState.label)}</div>
+        <div class="turn-menu-actions">
+          <button class="turn-action primary" data-turn-continue="${escapeHtml(turnMenuState.resumeId)}" data-turn-user="${escapeHtml(userId)}">从此继续</button>
+          <button class="turn-action" data-turn-restore="${escapeHtml(turnMenuState.snapshotId)}" data-turn-label="${escapeHtml(turnMenuState.label)}"${restoreDisabled}>恢复快照</button>
+        </div>`;
+      menu.hidden = false;
+      const width = 180;
+      const height = turnMenuState.snapshotId ? 104 : 104;
+      menu.style.left = `${Math.min(clientX, window.innerWidth - width - 12)}px`;
+      menu.style.top = `${Math.min(clientY, window.innerHeight - height - 12)}px`;
+      scrollToMessage(userId);
+    }
+
+    function hideTurnMenu() {
+      turnMenuState = null;
+      const menu = $("turnMenu");
+      if (menu) menu.hidden = true;
+    }
+
+    async function continueFromTurn(messageId, scrollMessageId = "") {
+      hideTurnMenu();
+      await checkoutMessage(messageId, scrollMessageId || messageId);
+    }
+
+    async function checkoutMessage(messageId, scrollMessageId = "") {
       const conversation = currentConversation();
       if (!conversation || !messageId || runningFor(conversation.id)) return;
       const updated = await api("/api/conversations/checkout", {
@@ -1650,6 +2293,33 @@ INDEX_HTML = r"""<!doctype html>
       state.projectId = updated.project_id;
       state.conversationId = updated.id;
       render();
+      scrollToMessage(scrollMessageId || messageId);
+    }
+
+    async function restoreSnapshotForTurn(snapshotId, label) {
+      const conversation = currentConversation();
+      if (!conversation || runningFor(conversation.id)) return;
+      if (!snapshotId) {
+        alert("这个节点没有可恢复的代码快照。只有 Agent 修改过文件的回合才会生成快照。");
+        return;
+      }
+      const confirmed = confirm(
+        `把代码恢复到“${label}”这轮 Agent 运行完毕时的状态？\n\n恢复前会先备份当前相关文件，但被恢复路径上的当前改动会被覆盖。`,
+      );
+      if (!confirmed) return;
+      try {
+        const result = await api("/api/conversations/restore-snapshot", {
+          method: "POST",
+          body: JSON.stringify({
+            conversation_id: conversation.id,
+            snapshot_id: snapshotId,
+          }),
+        });
+        alert(`已恢复 ${result.restored_files.length} 个文件。当前状态已备份为 ${result.backup_id}。`);
+        await loadState();
+      } catch (error) {
+        alert(`恢复失败: ${error.message}`);
+      }
     }
 
     function lastRole(messages) {
@@ -1695,7 +2365,20 @@ INDEX_HTML = r"""<!doctype html>
         ? `<div class="elapsed">已处理 ${elapsedSeconds(message.started_at)} 秒</div>`
         : "";
       const content = renderMessageContent(message);
-      return `<div class="message ${message.role}${pending}">${elapsed}<div class="message-content">${content}</div>${events}</div>`;
+      const anchor = message.id ? ` id="${messageElementId(message.id)}"` : "";
+      return `<div${anchor} class="message ${message.role}${pending}">${elapsed}<div class="message-content">${content}</div>${events}</div>`;
+    }
+
+    function scrollToMessage(messageId) {
+      if (!messageId) return;
+      requestAnimationFrame(() => {
+        const target = document.getElementById(messageElementId(messageId));
+        if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
+      });
+    }
+
+    function messageElementId(messageId) {
+      return `message-${String(messageId).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
     }
 
     function renderEvents(message) {
@@ -1738,45 +2421,60 @@ INDEX_HTML = r"""<!doctype html>
       const nodes = conversation.message_tree || conversation.messages || [];
       if (!nodes.length) return `<div class="day-empty">暂无节点</div>`;
       const activeId = conversation.current_message_id || (conversation.messages.at(-1)?.id || "");
-      const pathIds = new Set((conversation.messages || []).map((message) => message.id).filter(Boolean));
-      const childCount = {};
+      const pathIds = new Set((conversation.messages || [])
+        .filter((message) => message.role === "user")
+        .map((message) => message.id)
+        .filter(Boolean));
+      const childrenByParent = {};
       for (const node of nodes) {
         const parentId = node.parent_id || "";
-        childCount[parentId] = (childCount[parentId] || 0) + 1;
+        if (!childrenByParent[parentId]) childrenByParent[parentId] = [];
+        childrenByParent[parentId].push(node);
       }
-      const depths = messageDepths(nodes);
+      function replyForUser(user) {
+        return (childrenByParent[user.id] || []).find((child) => child.role === "assistant") || null;
+      }
+      function resumeIdForUser(user) {
+        const reply = replyForUser(user);
+        return reply && reply.id ? reply.id : user.id;
+      }
+      const allTurns = nodes.filter((message) => message.role === "user");
+      const userChildrenByParent = {};
+      for (const message of allTurns) {
+        const parentId = message.parent_id || "";
+        if (!userChildrenByParent[parentId]) userChildrenByParent[parentId] = [];
+        userChildrenByParent[parentId].push(message);
+      }
+      const turnDepths = {};
+      function visibleDepthForTurn(message) {
+        if (!message || !message.id) return 0;
+        if (turnDepths[message.id] !== undefined) return turnDepths[message.id];
+        const parent = nodes.find((node) => node.id === message.parent_id) || null;
+        const parentTurn = parent && parent.role === "assistant"
+          ? nodes.find((node) => node.id === parent.parent_id && node.role === "user")
+          : null;
+        const siblingCount = (userChildrenByParent[message.parent_id || ""] || []).length;
+        const parentDepth = parentTurn ? visibleDepthForTurn(parentTurn) : 0;
+        turnDepths[message.id] = parentTurn && siblingCount > 1 ? parentDepth + 1 : parentDepth;
+        return turnDepths[message.id];
+      }
       return `<div class="session-tree">${
-        nodes.map((message) => {
-          const id = message.id || "";
-          const active = id && id === activeId ? " active" : "";
-          const onPath = pathIds.has(id) ? " on-path" : "";
-          const depth = Math.min(depths[id] || 0, 6);
-          const children = childCount[id] || 0;
-          const branch = children > 1 ? ` <span class="branch-count">分叉 ${children}</span>` : "";
-          const label = `${message.role === "user" ? "你" : "Agent"}：${messagePreview(message.content || "")}`;
-          return `<button class="tree-node${active}${onPath}" data-message-checkout="${escapeHtml(id)}" style="padding-left:${8 + depth * 12}px" title="${escapeHtml(label)}"><span class="tree-label">${escapeHtml(label)}${branch}</span></button>`;
+        allTurns.map((message) => {
+          const userId = message.id || "";
+          const resumeId = resumeIdForUser(message) || userId;
+          const active = resumeId && (resumeId === activeId || userId === activeId) ? " active" : "";
+          const onPath = pathIds.has(userId) ? " on-path" : "";
+          const branchChildren = (childrenByParent[resumeId || userId] || [])
+            .filter((child) => child.role === "user" && child.id);
+          const branch = branchChildren.length > 1 ? ` <span class="branch-count">分支 ${branchChildren.length}</span>` : "";
+          const label = `你：${messagePreview(message.content || "")}`;
+          const reply = replyForUser(message);
+          const snapshotId = reply?.workspace_snapshot_id || "";
+          const snapshotBadge = snapshotId ? ` <span class="snapshot-badge">快照</span>` : "";
+          const depth = Math.min(visibleDepthForTurn(message), 6);
+          return `<div class="tree-entry" style="--tree-indent:${depth * 14}px"><button class="tree-node${active}${onPath}" data-turn-select="${escapeHtml(userId)}" data-turn-user="${escapeHtml(userId)}" data-message-checkout="${escapeHtml(resumeId)}" data-message-scroll="${escapeHtml(userId)}" data-snapshot-id="${escapeHtml(snapshotId)}" data-turn-label="${escapeHtml(label)}" title="${escapeHtml(label)}"><span class="tree-label">${escapeHtml(label)}${branch}${snapshotBadge}</span></button></div>`;
         }).join("")
       }</div>`;
-    }
-
-    function messageDepths(nodes) {
-      const byId = {};
-      for (const node of nodes) {
-        if (node.id) byId[node.id] = node;
-      }
-      const cache = {};
-      function depthOf(id, seen = new Set()) {
-        if (!id || !byId[id] || seen.has(id)) return 0;
-        if (cache[id] !== undefined) return cache[id];
-        seen.add(id);
-        const parentId = byId[id].parent_id || "";
-        cache[id] = parentId && byId[parentId] ? depthOf(parentId, seen) + 1 : 0;
-        return cache[id];
-      }
-      for (const node of nodes) {
-        if (node.id) depthOf(node.id);
-      }
-      return cache;
     }
 
     function messagePreview(content) {
@@ -1910,6 +2608,8 @@ INDEX_HTML = r"""<!doctype html>
         .replaceAll('"', "&quot;");
     }
 
+    loadLayout();
+    setupResizers();
     loadState().catch((error) => alert(error.message));
   </script>
 </body>
