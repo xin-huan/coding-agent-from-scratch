@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1270,7 +1271,31 @@ def _should_enable_subagents(
         marker in normalized
         for marker in ("subagent", "sub-agent", "子agent", "子 agent", "多代理")
     )
-    complex_markers = (
+    if explicit:
+        return True, "用户明确提到 SubAgent"
+
+    profile = _workspace_profile(workspace, limit=max(file_threshold + 10, 80))
+    score, reasons = _requirement_complexity_score(
+        task,
+        profile=profile,
+        file_threshold=file_threshold,
+    )
+    if score >= 5:
+        return True, f"需求复杂度评分 {score}：{'；'.join(reasons)}"
+    return False, f"需求复杂度评分 {score}，无需委派：{'；'.join(reasons) or '任务范围较小'}"
+
+
+def _requirement_complexity_score(
+    task: str,
+    *,
+    profile: dict[str, object],
+    file_threshold: int,
+) -> tuple[int, list[str]]:
+    normalized = task.casefold()
+    reasons: list[str] = []
+    score = 0
+
+    legacy_markers = (
         "大型",
         "复杂",
         "多模块",
@@ -1294,20 +1319,175 @@ def _should_enable_subagents(
         "performance",
         "security",
     )
-    marker_score = sum(1 for marker in complex_markers if marker in normalized)
-    profile = _workspace_profile(workspace, limit=max(file_threshold + 10, 80))
-    domain_score = len(profile["domains"])
+    legacy_score = sum(1 for marker in legacy_markers if marker in normalized)
+    if legacy_score:
+        score += min(legacy_score, 4)
+        reasons.append(f"显式复杂度信号 {legacy_score} 个")
+
+    feature_count = _feature_count(task)
+    if feature_count >= 7:
+        score += 4
+        reasons.append(f"功能点约 {feature_count} 个")
+    elif feature_count >= 4:
+        score += 3
+        reasons.append(f"功能点约 {feature_count} 个")
+    elif feature_count >= 2:
+        score += 1
+        reasons.append(f"功能点约 {feature_count} 个")
+
+    delivery_markers = (
+        "系统",
+        "平台",
+        "管理后台",
+        "后台管理",
+        "完整项目",
+        "完整应用",
+        "桌面应用",
+        "桌面小应用",
+        "网站",
+        "web app",
+        "api 服务",
+        "api service",
+        "from scratch",
+        "从零",
+        "搭建",
+        "开发一个",
+        "创建一个",
+    )
+    if any(marker in normalized for marker in delivery_markers):
+        score += 2
+        reasons.append("交付形态是完整系统/应用")
+
+    task_domains = _task_domains(normalized)
+    workspace_domains = {str(domain) for domain in profile["domains"]}
+    domains = task_domains | workspace_domains
+    domain_score = len(domains)
     file_count = int(profile["file_count"])
-    if explicit:
-        return True, "用户明确提到 SubAgent"
-    if marker_score >= 2 and (file_count >= file_threshold or domain_score >= 2):
-        return True, (
-            f"任务复杂度标记 {marker_score} 个，工作区约 {file_count} 个文件，"
-            f"领域 {domain_score} 个"
-        )
-    if marker_score >= 4:
-        return True, f"任务本身包含 {marker_score} 个复杂度标记"
-    return False, "任务规模不足，无需委派"
+    if domain_score >= 3:
+        score += 3
+        reasons.append(f"涉及 {domain_score} 个领域")
+    elif domain_score >= 2:
+        score += 2
+        reasons.append(f"涉及 {domain_score} 个领域")
+
+    if file_count >= file_threshold * 2:
+        score += 3
+        reasons.append(f"工作区约 {file_count} 个文件")
+    elif file_count >= file_threshold:
+        score += 2
+        reasons.append(f"工作区约 {file_count} 个文件")
+
+    quality_markers = (
+        "失败",
+        "报错",
+        "修复",
+        "重构",
+        "迁移",
+        "兼容",
+        "权限",
+        "登录",
+        "认证",
+        "鉴权",
+        "性能",
+        "安全",
+        "测试覆盖",
+        "test coverage",
+        "failing",
+        "error",
+        "refactor",
+        "migration",
+        "auth",
+        "permission",
+    )
+    quality_score = sum(1 for marker in quality_markers if marker in normalized)
+    if quality_score >= 2:
+        score += 2
+        reasons.append(f"质量/风险信号 {quality_score} 个")
+    elif quality_score == 1:
+        score += 1
+        reasons.append("存在质量/风险信号")
+
+    return score, reasons
+
+
+def _feature_count(task: str) -> int:
+    normalized = task.casefold()
+    feature_markers = (
+        "登录",
+        "注册",
+        "权限",
+        "认证",
+        "鉴权",
+        "用户",
+        "角色",
+        "管理",
+        "搜索",
+        "筛选",
+        "排序",
+        "统计",
+        "报表",
+        "导出",
+        "导入",
+        "上传",
+        "下载",
+        "通知",
+        "配置",
+        "设置",
+        "支付",
+        "订单",
+        "题库",
+        "考试",
+        "发布",
+        "判分",
+        "成绩",
+        "学生端",
+        "教师端",
+        "后台",
+        "接口",
+        "数据库",
+        "缓存",
+        "部署",
+        "login",
+        "register",
+        "auth",
+        "permission",
+        "role",
+        "search",
+        "filter",
+        "report",
+        "export",
+        "upload",
+        "notification",
+        "settings",
+        "payment",
+        "database",
+        "deploy",
+    )
+    marker_count = sum(1 for marker in feature_markers if marker in normalized)
+    list_count = 0
+    if any(marker in normalized for marker in ("包含", "含有", "支持", "需要", "具备", "实现")):
+        parts = [
+            part.strip()
+            for part in re.split(r"[、,，;；\n]+|以及|并且|和", task)
+            if len(part.strip()) >= 2
+        ]
+        list_count = max(0, len(parts) - 1)
+    return max(marker_count, list_count)
+
+
+def _task_domains(normalized: str) -> set[str]:
+    domains: set[str] = set()
+    domain_markers = {
+        "frontend": ("前端", "页面", "界面", "ui", "web", "react", "vue", "client"),
+        "backend": ("后端", "接口", "api", "server", "service", "服务端"),
+        "database": ("数据库", "db", "schema", "migration", "存储", "持久化"),
+        "tests": ("测试", "验证", "pytest", "unittest", "test", "spec"),
+        "desktop": ("桌面", "tkinter", "gui", "windows"),
+    }
+    for domain, markers in domain_markers.items():
+        if any(marker in normalized for marker in markers):
+            domains.add(domain)
+    return domains
 
 
 def _workspace_profile(workspace: Workspace, *, limit: int) -> dict[str, object]:

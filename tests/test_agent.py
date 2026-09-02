@@ -645,6 +645,31 @@ class AgentTests(unittest.TestCase):
             request = json.dumps(model.received_messages[0], ensure_ascii=False)
             self.assertNotIn("<subagent_policy>", request)
 
+    def test_feature_rich_system_request_enables_subagent_without_complex_keyword(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = FakeModel([ModelReply(content="我会先确认范围再实现。")])
+            events: list[str] = []
+
+            Agent(
+                model,
+                Workspace(Path(temp_dir)),
+                on_event=events.append,
+            ).run(
+                "帮我做一个在线考试系统，包含登录、学生端、教师端、题库、"
+                "考试发布、自动判分、成绩统计"
+            )
+
+            tool_names = {tool["function"]["name"] for tool in model.received_tools[0]}
+            self.assertIn("delegate_subagent", tool_names)
+            request = json.dumps(model.received_messages[0], ensure_ascii=False)
+            self.assertIn("<subagent_policy>", request)
+            self.assertTrue(
+                any("需求复杂度评分" in event for event in events),
+                events,
+            )
+
     def test_complex_task_can_delegate_to_read_only_subagent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

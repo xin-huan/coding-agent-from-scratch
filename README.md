@@ -1,54 +1,32 @@
 # coding-agent-from-scratch
-A lightweight coding agent built from scratch with native LLM tool calling, local tool execution, extension hooks, project memory, skills, and a custom agent loop.
 
-## Usage
+Git 仓库：https://github.com/xin-huan/coding-agent-from-scratch.git
 
-Run the terminal agent:
+这是一个本地 Coding Agent 系统。它直接调用 OpenAI 兼容模型接口，但 Agent 循环、工具定义、本地文件/命令执行、上下文压缩、项目记忆、SubAgent、聊天界面、Session 树和工作区快照都由项目自己实现。
 
+## 如何运行
+
+先参考 `.env.example` 配置 API Key，并保存为 `.env`，然后执行：
 ```powershell
-.\.venv\Scripts\coding-agent.exe --workspace D:\path\to\project
+cd 项目文件夹
+.\.venv\Scripts\python.exe -m coding_agent.chat --port 8767
 ```
 
-Run the minimal local chat UI:
+然后打开 http://127.0.0.1:8767 。
 
-```powershell
-.\.venv\Scripts\python.exe -m coding_agent.chat
-```
+## 特色功能
 
-Then open `http://127.0.0.1:8765`.
+1.**树状 Session 与代码快照恢复**。每轮对话保存为带 id/parent_id 的树节点，用户可以从历史节点继续形成新分支，同时保留旧分支。Agent 完成任务后会保存相关文件快照，用户可显式恢复到某一轮完成后的代码状态，并在恢复前备份当前文件。
 
-Project memory, chat history, long context outputs, and workspace snapshots are saved under `.coding-agent/` in the directory where the agent is launched. The memory stores project structure, user decisions, known launch commands, and historical task summaries.
+2.**基于生命周期 Hook 的 Extension 架构**。主循环只负责模型调用、工具执行、状态推进和终止判断；项目记忆、skill 选择、subagent 和上下文压缩都通过 Extension 接入，便于扩展复杂能力而不重写核心循环。
 
-## Skills
+3.**面向可靠交付的任务状态机**。TaskState 会维护任务阶段、修改文件、最近命令和测试状态。文件修改后必须完成相关验证；测试失败会进入修复阶段；只有没有缺失交付物、没有未验证实现改动，并且模型给出最终回复时才结束循环。
 
-The agent has a lightweight built-in skill registry implemented as an extension. Skills live as Markdown files under `src/coding_agent/skills/builtin/`, and the registry deterministically selects up to two relevant skills for each task based on trigger phrases. Selected skills are injected as task-specific system messages, recorded in the trace, and shown in live chat events.
+4.**上下文与记忆管理**。系统区分单次任务上下文、对话级历史和项目记忆：单次任务上下文服务当前执行，对话级历史支持回看、分支和恢复，项目记忆让同一项目的不同对话保持连续性。长工具输出会外置为 id，历史过长时会压缩较早工具交互并保留最近工作集。
 
-Built-in skills:
+5.**SubAgent 审查机制**。复杂任务中可以委派 researcher、tester、reviewer。Reviewer SubAgent 会在复杂改动后独立审查 patch、风险和验证建议，但最终决策仍由主 Agent 负责。
 
-- `diagnose`: reproduce bugs, failures, exceptions, regressions, and performance issues before fixing them.
-- `verification`: compare delivery against requirements, add/update tests, and run real verification before completion.
-- `desktop-python`: keep Python desktop apps testable and cover UI callbacks where possible.
-- `web-ui`: handle immediate UI feedback, progress states, errors, and request/rendering paths.
-- `project-summary`: explain the live project using memory as orientation, not as a substitute for inspection.
 
-## Context Pack
+## 实验验证
 
-Long conversations are handled by a default `ContextPackExtension`. It keeps raw long outputs in a local `.coding-agent/context-outputs/` store, puts only a compact summary and `output_id` into the model context, and registers `read_context_output` so the model can fetch exact line ranges when needed. When a model request grows beyond roughly 40,000 characters, it also replaces older assistant/tool-call exchanges with structured `<compacted_history>` summaries.
-
-The older v2/v3 single-task context manager and read cache experiments have been removed. Context packing changes the request copy sent to the model and offloads oversized tool outputs, but the exact long output remains recoverable by id for diagnosis and re-summary.
-
-## Extensions
-
-The agent exposes lifecycle hooks in `src/coding_agent/extensions.py` so new framework behavior can be added without editing the core loop. Extensions can inject context, add tool definitions, observe LLM calls, subscribe to context compaction, intercept or implement tool calls, and save state at session end. Project memory, skill selection, and context packing are now ordinary extensions.
-
-## Tasks and Subagents
-
-Every run exposes a lightweight task list through live `[任务]` events and the runtime `<task_state>`. From-scratch project work uses the reviewed implementation plan as its task list; other work gets a default inspect/change/verify/finalize list.
-
-The default `SubAgentExtension` enables `delegate_subagent` only when the request or workspace appears complex enough, such as multi-domain failure analysis, large projects, architecture reviews, performance/security investigations, or an explicit subagent request. The system intentionally supports only three bounded roles: `researcher` for read-only module and architecture discovery, `tester` for verification strategy and restricted test execution, and `reviewer` for patch review after non-trivial changes. None of them can edit files or make the final decision. After complex file changes, final verification is gated: a premature verification command is converted into reviewer delegation first, then the main agent judges the report, fixes anything needed, and runs verification itself.
-
-## Tree Sessions
-
-Chat history is stored as a message tree instead of only a flat list. Each message has an `id` and `parent_id`, and each conversation tracks `current_message_id`. The UI renders the current branch as normal chat while the Session tree shows all user-turn nodes as a history directory. Left-clicking a node only scrolls to the user request when it is visible; right-clicking opens explicit actions such as continuing from that turn. Normal linear history stays aligned on one vertical line, while real sibling branches are indented.
-
-When an Agent run changes text files, the chat UI also stores a lightweight workspace snapshot under `.coding-agent/workspace-snapshots/` and binds it to that turn. Restoring code is always explicit: right-click a turn, choose restore snapshot, confirm the warning, then the current related files are backed up before restoration.
+项目包含多组本地 Eval，覆盖创建项目、增加功能、修复 Bug、解释项目和异常恢复。实验中发现部分失败来自 Runtime 收尾和评分器误判，而不只是模型能力不足，因此加入确定性终止、澄清门、检查点恢复和交付验证机制。结果显示这些机制能提升 Agent 完成真实编程任务的稳定性。
