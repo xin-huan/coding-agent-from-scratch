@@ -1538,6 +1538,177 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 8px;
       padding-top: 0;
     }
+    .event-lines {
+      white-space: pre-wrap;
+    }
+    .command-result {
+      margin: 8px 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f7faf9;
+      overflow: hidden;
+    }
+    .command-result summary {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .command-status {
+      font-weight: 650;
+      color: var(--accent-strong);
+    }
+    .command-status.failed {
+      color: #b42318;
+    }
+    .command-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: Consolas, "SFMono-Regular", monospace;
+    }
+    .command-exit {
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .command-body {
+      border-top: 1px solid var(--line);
+      padding: 8px 10px 10px;
+    }
+    .command-meta {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-family: Consolas, "SFMono-Regular", monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .command-output {
+      margin-top: 8px;
+    }
+    .command-output-title {
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-weight: 650;
+    }
+    .command-output pre {
+      margin: 0;
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--text);
+      padding: 8px 10px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .task-board,
+    .file-change,
+    .reviewer-result {
+      margin: 8px 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      overflow: hidden;
+    }
+    .event-card-title {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      color: var(--text);
+      font-weight: 650;
+    }
+    .task-items {
+      display: grid;
+      gap: 6px;
+      padding: 8px 10px 10px;
+    }
+    .task-item {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: start;
+      gap: 8px;
+    }
+    .task-badge,
+    .file-badge,
+    .review-badge {
+      display: inline-flex;
+      align-items: center;
+      min-width: 58px;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 650;
+      line-height: 1.5;
+      border: 1px solid var(--line);
+      background: #f6f7f9;
+      color: var(--muted);
+    }
+    .task-badge.done,
+    .file-badge.success,
+    .review-badge.passed {
+      background: #e8f5f3;
+      border-color: #b9ded8;
+      color: var(--accent-strong);
+    }
+    .task-badge.current {
+      background: #fff7ed;
+      border-color: #fed7aa;
+      color: #9a3412;
+    }
+    .task-badge.failed,
+    .file-badge.failed,
+    .review-badge.issues {
+      background: #fef3f2;
+      border-color: #fecdca;
+      color: #b42318;
+    }
+    .task-text {
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .file-change,
+    .reviewer-result {
+      padding: 8px 10px 10px;
+    }
+    .file-change-head,
+    .reviewer-head {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+    }
+    .file-path {
+      color: var(--text);
+      font-family: Consolas, "SFMono-Regular", monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .file-stats,
+    .review-meta {
+      margin-top: 6px;
+      color: var(--muted);
+      font-family: Consolas, "SFMono-Regular", monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .review-summary {
+      margin-top: 6px;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .review-list {
+      margin: 8px 0 0;
+      padding-left: 18px;
+      color: var(--text);
+    }
+    .review-list li {
+      margin-top: 4px;
+    }
     .composer {
       background: var(--panel);
       border-top: 1px solid var(--line);
@@ -1631,6 +1802,9 @@ INDEX_HTML = r"""<!doctype html>
       sidebar: "coding-agent.sidebar-width",
       nav: "coding-agent.nav-width",
     };
+    const commandResultEventPrefix = "[命令结果] ";
+    const fileChangeEventPrefix = "[文件改动] ";
+    const reviewerResultEventPrefix = "[Reviewer结果] ";
 
     function clamp(value, min, max) {
       return Math.min(Math.max(value, min), max);
@@ -2383,9 +2557,189 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderEvents(message) {
       if (!message.events || !message.events.length) return "";
-      const body = `<div class="events">${escapeHtml(message.events.join("\n"))}</div>`;
+      const body = `<div class="events">${renderEventItems(message.events)}</div>`;
       if (message.pending) return body;
       return `<details class="events-details"><summary>执行过程 ${message.events.length} 条</summary>${body}</details>`;
+    }
+
+    function renderEventItems(events) {
+      const parts = [];
+      let lines = [];
+      let taskItems = [];
+      function flushLines() {
+        if (!lines.length) return;
+        parts.push(`<div class="event-lines">${escapeHtml(lines.join("\n"))}</div>`);
+        lines = [];
+      }
+      function flushTasks() {
+        if (!taskItems.length) return;
+        flushLines();
+        parts.push(renderTaskBoard(taskItems));
+        taskItems = [];
+      }
+      for (const event of events) {
+        const taskItem = parseTaskEvent(event);
+        if (taskItem) {
+          flushLines();
+          taskItems.push(taskItem);
+          continue;
+        }
+        const commandResult = parseCommandResultEvent(event);
+        if (commandResult) {
+          flushTasks();
+          parts.push(renderCommandResult(commandResult));
+          continue;
+        }
+        const fileChange = parseJsonEvent(event, fileChangeEventPrefix);
+        if (fileChange) {
+          flushTasks();
+          parts.push(renderFileChange(fileChange));
+          continue;
+        }
+        const reviewerResult = parseJsonEvent(event, reviewerResultEventPrefix);
+        if (reviewerResult) {
+          flushTasks();
+          parts.push(renderReviewerResult(reviewerResult));
+          continue;
+        }
+        flushTasks();
+        lines.push(String(event));
+      }
+      flushTasks();
+      flushLines();
+      return parts.join("");
+    }
+
+    function parseTaskEvent(event) {
+      const match = String(event || "").match(/^\[任务\]\s+(\d+)\.\s+-\s+\[([^\]]+)\]\s+(.+)$/);
+      if (!match) return null;
+      return {
+        index: Number(match[1]),
+        status: match[2],
+        text: match[3],
+      };
+    }
+
+    function parseCommandResultEvent(event) {
+      const text = String(event || "");
+      if (!text.startsWith(commandResultEventPrefix)) return null;
+      return parseJsonEvent(event, commandResultEventPrefix);
+    }
+
+    function parseJsonEvent(event, prefix) {
+      const text = String(event || "");
+      if (!text.startsWith(prefix)) return null;
+      try {
+        const parsed = JSON.parse(text.slice(prefix.length));
+        return parsed && typeof parsed === "object" ? parsed : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function renderTaskBoard(items) {
+      const body = items.map((item) => {
+        const status = normalizedStatus(item.status);
+        return `<div class="task-item"><span class="task-badge ${status}">${escapeHtml(statusLabel(status))}</span><span class="task-text">${escapeHtml(item.index)}. ${escapeHtml(item.text)}</span></div>`;
+      }).join("");
+      return `<div class="task-board"><div class="event-card-title">任务进度</div><div class="task-items">${body}</div></div>`;
+    }
+
+    function normalizedStatus(status) {
+      const value = String(status || "").toLowerCase();
+      if (["done", "current", "failed", "pending"].includes(value)) return value;
+      return "pending";
+    }
+
+    function statusLabel(status) {
+      return {
+        done: "完成",
+        current: "当前",
+        failed: "失败",
+        pending: "待办",
+      }[status] || "待办";
+    }
+
+    function renderCommandResult(result) {
+      const command = String(result.command || "run_command");
+      const exitCode = result.exitCode;
+      const passed = exitCode === 0;
+      const status = passed ? "通过" : "失败";
+      const statusClass = passed ? "command-status" : "command-status failed";
+      const exitLabel = Number.isInteger(exitCode) ? `退出码 ${exitCode}` : "无退出码";
+      const stdout = String(result.stdout || "");
+      const stderr = String(result.stderr || "");
+      const cwd = String(result.cwd || ".");
+      const blocks = [
+        `<div class="command-meta">命令：${escapeHtml(command)}\n目录：${escapeHtml(cwd)}\n${escapeHtml(exitLabel)}</div>`,
+      ];
+      if (stdout) blocks.push(renderCommandOutput("输出", stdout));
+      if (stderr) blocks.push(renderCommandOutput(passed ? "错误输出" : "错误摘要", stderr));
+      if (!stdout && !stderr) blocks.push(`<div class="command-meta">没有输出。</div>`);
+      return [
+        `<details class="command-result">`,
+        `<summary><span class="${statusClass}">${status}</span><span class="command-title">${escapeHtml(command)}</span><span class="command-exit">${escapeHtml(exitLabel)}</span></summary>`,
+        `<div class="command-body">${blocks.join("")}</div>`,
+        `</details>`,
+      ].join("");
+    }
+
+    function renderCommandOutput(title, text) {
+      return `<div class="command-output"><div class="command-output-title">${escapeHtml(title)}</div><pre>${escapeHtml(text)}</pre></div>`;
+    }
+
+    function renderFileChange(change) {
+      const success = change.success !== false;
+      const status = success ? "success" : "failed";
+      const statusText = success ? "修改成功" : "修改失败";
+      const path = String(change.path || "unknown");
+      const added = Number(change.added || 0);
+      const removed = Number(change.removed || 0);
+      const summary = String(change.summary || "");
+      const characters = Number(change.characters || 0);
+      const stats = [
+        `工具：${String(change.tool || "file")}`,
+        `变更：+${added} -${removed}`,
+        characters ? `字符：${characters}` : "",
+        summary ? `结果：${summary}` : "",
+      ].filter(Boolean).join("\n");
+      return [
+        `<div class="file-change">`,
+        `<div class="file-change-head"><span class="file-badge ${status}">${statusText}</span><span class="file-path">${escapeHtml(path)}</span></div>`,
+        `<div class="file-stats">${escapeHtml(stats)}</div>`,
+        `</div>`,
+      ].join("");
+    }
+
+    function renderReviewerResult(result) {
+      const status = result.status === "issues" ? "issues" : "passed";
+      const statusText = status === "issues" ? "发现问题" : "审查通过";
+      const findings = Array.isArray(result.findings) ? result.findings : [];
+      const risks = Array.isArray(result.risks) ? result.risks : [];
+      const confidence = Number(result.confidence);
+      const confidenceText = Number.isFinite(confidence) ? `${Math.round(confidence * 100)}%` : "未知";
+      const summary = String(result.summary || "Reviewer 已完成审查。");
+      const nextStep = String(result.recommendedNextStep || "");
+      const findingItems = findings.map((finding) => {
+        const severity = String(finding.severity || "info");
+        const detail = String(finding.detail || "");
+        const evidence = String(finding.evidence || "");
+        const text = [severity, detail, evidence ? `证据：${evidence}` : ""].filter(Boolean).join("｜");
+        return `<li>${escapeHtml(text)}</li>`;
+      }).join("");
+      const riskItems = risks.map((risk) => `<li>${escapeHtml(String(risk))}</li>`).join("");
+      const lists = [
+        findingItems ? `<ul class="review-list">${findingItems}</ul>` : "",
+        riskItems ? `<ul class="review-list">${riskItems}</ul>` : "",
+      ].join("");
+      return [
+        `<div class="reviewer-result">`,
+        `<div class="reviewer-head"><span class="review-badge ${status}">${statusText}</span><strong>Reviewer Subagent</strong></div>`,
+        `<div class="review-summary">${escapeHtml(summary)}</div>`,
+        lists,
+        `<div class="review-meta">发现：${findings.length} 项\n置信度：${escapeHtml(confidenceText)}${nextStep ? `\n下一步：${escapeHtml(nextStep)}` : ""}</div>`,
+        `</div>`,
+      ].join("");
     }
 
     function daysForMessages(messages) {

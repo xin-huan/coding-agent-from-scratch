@@ -382,6 +382,23 @@ class ChatTests(unittest.TestCase):
         self.assertIn("openTurnMenu(nodeButton", INDEX_HTML)
         self.assertIn("restoreSnapshotForTurn", INDEX_HTML)
 
+    def test_chat_ui_renders_expandable_command_results(self) -> None:
+        self.assertIn('const commandResultEventPrefix = "[命令结果] ";', INDEX_HTML)
+        self.assertIn('const fileChangeEventPrefix = "[文件改动] ";', INDEX_HTML)
+        self.assertIn('const reviewerResultEventPrefix = "[Reviewer结果] ";', INDEX_HTML)
+        self.assertIn("parseCommandResultEvent", INDEX_HTML)
+        self.assertIn("parseTaskEvent", INDEX_HTML)
+        self.assertIn("renderCommandResult", INDEX_HTML)
+        self.assertIn("renderTaskBoard", INDEX_HTML)
+        self.assertIn("renderFileChange", INDEX_HTML)
+        self.assertIn("renderReviewerResult", INDEX_HTML)
+        self.assertIn("command-result", INDEX_HTML)
+        self.assertIn("file-change", INDEX_HTML)
+        self.assertIn("reviewer-result", INDEX_HTML)
+        self.assertIn("task-badge", INDEX_HTML)
+        self.assertIn("退出码", INDEX_HTML)
+        self.assertIn("错误摘要", INDEX_HTML)
+
     def test_chat_ui_scrolls_checkout_to_user_turn_top(self) -> None:
         self.assertIn("scrollToMessage(scrollMessageId || messageId)", INDEX_HTML)
         self.assertIn("function messageElementId", INDEX_HTML)

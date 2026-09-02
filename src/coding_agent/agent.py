@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -58,6 +59,8 @@ FINAL_ANSWER_PROTOCOL_MARKERS = (
     "<function=",
 )
 DEFAULT_MAX_STEPS = 16
+COMMAND_RESULT_EVENT_PREFIX = "[命令结果] "
+FILE_CHANGE_EVENT_PREFIX = "[文件改动] "
 ASK_USER_DEFINITION = {
     "type": "function",
     "function": {
@@ -446,6 +449,8 @@ class TaskState:
         if _task_mentions_tests(normalized):
             if self.full_tests_passed:
                 return "done"
+            if self.phase == "repair" or self.latest_command == "failed":
+                return "failed"
             return "current" if self.phase in {"verify", "repair"} else "pending"
         if _task_mentions_entry(normalized):
             return "done" if "entry point" not in self.missing_deliverables else "pending"
@@ -519,7 +524,7 @@ def _contains_usage_documentation(content: str) -> bool:
 
 def _default_task_list(phase: str) -> list[str]:
     if phase == "repair":
-        return ["复现和定位失败", "实施最小修复", "重新运行相关验证", "整理交付结果"]
+        return ["检查相关文件", "完成必要修改", "运行相关验证", "定位失败并修复", "整理交付结果"]
     return ["检查相关文件", "完成必要修改", "运行相关验证", "整理交付结果"]
 
 
@@ -540,7 +545,13 @@ def _default_task_status(
             return "done"
         return "current" if index == 1 else "pending"
     if phase == "repair":
-        return "current" if index == 0 else "pending"
+        if index in {0, 1} and changed:
+            return "done"
+        if index == 2:
+            return "failed"
+        if index == 3:
+            return "current"
+        return "pending"
     if phase == "verify":
         if index == 0 or (index == 1 and changed):
             return "done"
@@ -601,6 +612,120 @@ def _is_full_test_command(call: ToolCall) -> bool:
     if not program.startswith("python"):
         return False
     return len(arguments) >= 3 and arguments[1:3] == ["-m", "unittest"]
+
+
+def _command_result_event(call: ToolCall, result: str) -> str:
+    parsed = _parse_command_result(result)
+    argv = call.arguments.get("argv")
+    cwd = call.arguments.get("cwd", ".")
+    data = {
+        "command": _display_command(argv),
+        "cwd": str(cwd) if isinstance(cwd, str) else ".",
+        "exitCode": parsed["exitCode"],
+        "stdout": _compact_command_output(parsed["stdout"]),
+        "stderr": _compact_command_output(parsed["stderr"]),
+    }
+    return COMMAND_RESULT_EVENT_PREFIX + json.dumps(data, ensure_ascii=False)
+
+
+def _file_change_event(call: ToolCall, result: str, success: bool) -> str:
+    data: dict[str, object] = {
+        "tool": call.name,
+        "path": str(call.arguments.get("path", "unknown")),
+        "success": success,
+        "summary": _compact_text(result, 240),
+    }
+    if call.name == "write_file":
+        content = str(call.arguments.get("content", ""))
+        data.update(
+            {
+                "change": "write",
+                "added": len(content.splitlines()),
+                "removed": 0,
+                "characters": len(content),
+            }
+        )
+    elif call.name == "apply_patch":
+        old_text = str(call.arguments.get("old_text", ""))
+        new_text = str(call.arguments.get("new_text", ""))
+        added, removed = _line_delta(old_text, new_text)
+        data.update(
+            {
+                "change": "patch",
+                "added": added,
+                "removed": removed,
+                "characters": len(new_text),
+            }
+        )
+    return FILE_CHANGE_EVENT_PREFIX + json.dumps(data, ensure_ascii=False)
+
+
+def _line_delta(old_text: str, new_text: str) -> tuple[int, int]:
+    added = 0
+    removed = 0
+    for line in difflib.ndiff(old_text.splitlines(), new_text.splitlines()):
+        if line.startswith("+ "):
+            added += 1
+        elif line.startswith("- "):
+            removed += 1
+    return added, removed
+
+
+def _display_command(argv: object) -> str:
+    if not isinstance(argv, list):
+        return "run_command"
+    return " ".join(_quote_command_argument(str(argument)) for argument in argv)
+
+
+def _quote_command_argument(argument: str) -> str:
+    if argument and not re.search(r'\s|"', argument):
+        return argument
+    return '"' + argument.replace('"', '\\"') + '"'
+
+
+def _parse_command_result(result: str) -> dict[str, object]:
+    lines = result.splitlines()
+    exit_code: int | None = None
+    if lines:
+        match = re.match(r"Exit code:\s*(-?\d+)", lines[0])
+        if match:
+            exit_code = int(match.group(1))
+
+    sections: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    current: str | None = None
+    for line in lines[1:]:
+        if line == "STDOUT:":
+            current = "stdout"
+            continue
+        if line == "STDERR:":
+            current = "stderr"
+            continue
+        if current is not None:
+            sections[current].append(line)
+
+    if exit_code is None and not sections["stdout"] and not sections["stderr"]:
+        sections["stderr"].append(result)
+
+    return {
+        "exitCode": exit_code,
+        "stdout": "\n".join(sections["stdout"]).strip(),
+        "stderr": "\n".join(sections["stderr"]).strip(),
+    }
+
+
+def _compact_command_output(text: object, *, max_lines: int = 20) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    lines = value.splitlines()
+    if len(lines) <= max_lines:
+        return value
+    return "\n".join(
+        [
+            f"... omitted {len(lines) - max_lines} earlier lines ...",
+            *lines[-max_lines:],
+        ]
+    )
 
 
 def _test_command_ran_tests(call: ToolCall, result: str) -> bool:
@@ -704,6 +829,7 @@ class Agent:
         self._completion_tokens = 0
         self._cache_hit_tokens = 0
         self._session_tasks: list[SessionTaskSummary] = []
+        self._last_task_list_lines: tuple[str, ...] = ()
 
     @property
     def awaiting_clarification(self) -> bool:
@@ -1037,7 +1163,17 @@ class Agent:
         lines = state.task_list_lines()
         for index, line in enumerate(lines, start=1):
             self.on_event(f"[任务] {index}. {line}")
+        self._last_task_list_lines = tuple(lines)
         self.trace.record("task_list_updated", tasks=lines)
+
+    def _emit_task_list_if_changed(self, state: TaskState) -> None:
+        lines = tuple(state.task_list_lines())
+        if lines == self._last_task_list_lines:
+            return
+        for index, line in enumerate(lines, start=1):
+            self.on_event(f"[任务] {index}. {line}")
+        self._last_task_list_lines = lines
+        self.trace.record("task_list_updated", tasks=list(lines))
 
     def resume(self) -> str:
         self.on_event("[状态] 正在恢复任务")
@@ -1489,7 +1625,12 @@ class Agent:
                     self.on_event("[状态] 测试通过，正在整理结果")
                 else:
                     self.on_event("[状态] 测试失败，正在分析原因")
+            if call.name in {"write_file", "apply_patch"}:
+                self.on_event(_file_change_event(call, result, success))
+            if call.name == "run_command":
+                self.on_event(_command_result_event(call, result))
             state.update(call, result, success)
+            self._emit_task_list_if_changed(state)
             self.trace.record(
                 "tool_result",
                 step=step,

@@ -18,6 +18,7 @@ from coding_agent.workspace import Workspace
 
 Message = dict[str, object]
 ToolDefinition = dict[str, object]
+REVIEWER_RESULT_EVENT_PREFIX = "[Reviewer结果] "
 
 
 @dataclass(frozen=True)
@@ -632,6 +633,7 @@ class SubAgentExtension(BaseExtension):
         )
         if role == "reviewer":
             self._reviewed_revision = self._change_revision
+            context.emit(_reviewer_result_event(report))
             context.trace.record(
                 "subagent_review_completed",
                 step=step,
@@ -1533,6 +1535,54 @@ def _subagent_result_data(result: SubagentResult) -> dict[str, object]:
         "confidence": result.confidence,
         "risks": list(result.risks),
         "recommendedNextStep": result.recommended_next_step,
+    }
+
+
+def _reviewer_result_event(report: str) -> str:
+    data = _extract_subagent_report_data(report)
+    findings = data.get("findings", [])
+    risks = data.get("risks", [])
+    if not isinstance(findings, list):
+        findings = []
+    if not isinstance(risks, list):
+        risks = []
+    payload = {
+        "status": "issues" if findings else "passed",
+        "summary": _compact_inline(str(data.get("summary", "Review completed.")), 360),
+        "findings": [_compact_finding(item) for item in findings[:5]],
+        "risks": [_compact_inline(str(item), 240) for item in risks[:5]],
+        "confidence": data.get("confidence", 0.5),
+        "recommendedNextStep": _compact_inline(
+            str(data.get("recommendedNextStep", "")),
+            260,
+        ),
+    }
+    return REVIEWER_RESULT_EVENT_PREFIX + json.dumps(payload, ensure_ascii=False)
+
+
+def _extract_subagent_report_data(report: str) -> dict[str, object]:
+    lines = report.splitlines()
+    if len(lines) < 3:
+        return {}
+    body = "\n".join(lines[1:-1])
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _compact_finding(item: object) -> dict[str, str]:
+    if not isinstance(item, dict):
+        return {
+            "severity": "info",
+            "detail": _compact_inline(str(item), 260),
+            "evidence": "",
+        }
+    return {
+        "severity": _compact_inline(str(item.get("severity", "info")), 40),
+        "detail": _compact_inline(str(item.get("detail", "")), 260),
+        "evidence": _compact_inline(str(item.get("evidence", "")), 180),
     }
 
 

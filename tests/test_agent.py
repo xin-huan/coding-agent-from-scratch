@@ -5,12 +5,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_agent.agent import Agent, ModelReply, TaskState, TokenUsage, ToolCall
+from coding_agent.agent import (
+    COMMAND_RESULT_EVENT_PREFIX,
+    FILE_CHANGE_EVENT_PREFIX,
+    Agent,
+    ModelReply,
+    TaskState,
+    TokenUsage,
+    ToolCall,
+)
 from coding_agent.checkpoint import CheckpointStore
 from coding_agent.extensions import (
     BaseExtension,
     ContextPackExtension,
     ExtensionContext,
+    REVIEWER_RESULT_EVENT_PREFIX,
     ToolResult,
 )
 from coding_agent.project_memory import ProjectMemoryStore
@@ -599,6 +608,32 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(sum("[current]" in line for line in lines), 1)
         self.assertEqual(lines[0], "- [current] 检查相关文件")
 
+    def test_failed_verification_marks_task_failed_and_repair_current(self) -> None:
+        state = TaskState("修复项目")
+        state.update(
+            ToolCall(
+                "write-app",
+                "write_file",
+                {"path": "app.py", "content": "print('ok')\n"},
+            ),
+            "Wrote app.py",
+            success=True,
+        )
+        state.update(
+            ToolCall(
+                "test-app",
+                "run_command",
+                {"argv": ["python", "-m", "unittest"]},
+            ),
+            "Exit code: 1\nSTDERR:\nFAILED",
+            success=True,
+        )
+
+        lines = state.task_list_lines()
+
+        self.assertIn("- [failed] 运行相关验证", lines)
+        self.assertIn("- [current] 定位失败并修复", lines)
+
     def test_subagent_tool_is_not_offered_for_simple_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model = FakeModel([ModelReply(content="完成。")])
@@ -728,11 +763,13 @@ class AgentTests(unittest.TestCase):
             write_smoke_suite(root)
             model = ReviewerGateModel()
             trace = JsonlTrace(root / "trace.jsonl")
+            events: list[str] = []
 
             answer = Agent(
                 model,
                 Workspace(root),
                 trace=trace,
+                on_event=events.append,
             ).run("分析这个大型复杂项目运行失败，涉及前端、后端、数据库，并修复问题")
 
             self.assertEqual(answer, "已修复并通过测试。")
@@ -751,6 +788,17 @@ class AgentTests(unittest.TestCase):
             self.assertIn("subagent_review_required", names)
             self.assertIn("subagent_review_auto_delegated", names)
             self.assertIn("subagent_review_completed", names)
+            reviewer_events = [
+                event
+                for event in events
+                if event.startswith(REVIEWER_RESULT_EVENT_PREFIX)
+            ]
+            self.assertEqual(len(reviewer_events), 1)
+            payload = json.loads(
+                reviewer_events[0][len(REVIEWER_RESULT_EVENT_PREFIX) :]
+            )
+            self.assertEqual(payload["status"], "passed")
+            self.assertIn("Changed backend/auth.py", payload["summary"])
 
     def test_context_pack_compacts_old_tool_exchanges_but_keeps_recent_result(
         self,
@@ -1517,6 +1565,84 @@ class AgentTests(unittest.TestCase):
             self.assertIn("Phase: inspect", state)
             self.assertIn("Latest command: passed (exit 0)", state)
             self.assertNotIn("Return a final answer now", state)
+
+    def test_run_command_event_includes_expandable_result_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "check.py").write_text("print('ok')\n", encoding="utf-8")
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "call-1",
+                                "run_command",
+                                {"argv": ["python", "check.py"]},
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="验证通过。"),
+                ]
+            )
+
+            Agent(model, Workspace(root), max_steps=2, on_event=events.append).run(
+                "验证项目"
+            )
+
+            payload_events = [
+                event
+                for event in events
+                if event.startswith(COMMAND_RESULT_EVENT_PREFIX)
+            ]
+            self.assertEqual(len(payload_events), 1)
+            payload = json.loads(
+                payload_events[0][len(COMMAND_RESULT_EVENT_PREFIX) :]
+            )
+            self.assertEqual(payload["command"], "python check.py")
+            self.assertEqual(payload["exitCode"], 0)
+            self.assertIn("ok", payload["stdout"])
+
+    def test_file_change_event_includes_visible_patch_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "notes.txt").write_text("old\n", encoding="utf-8")
+            events: list[str] = []
+            model = FakeModel(
+                [
+                    ModelReply(
+                        content=None,
+                        tool_calls=(
+                            ToolCall(
+                                "patch-1",
+                                "apply_patch",
+                                {
+                                    "path": "notes.txt",
+                                    "old_text": "old\n",
+                                    "new_text": "new\ndone\n",
+                                },
+                            ),
+                        ),
+                    ),
+                    ModelReply(content="修改完成。"),
+                ]
+            )
+
+            Agent(model, Workspace(root), max_steps=2, on_event=events.append).run(
+                "修改输出"
+            )
+
+            payload_events = [
+                event for event in events if event.startswith(FILE_CHANGE_EVENT_PREFIX)
+            ]
+            self.assertEqual(len(payload_events), 1)
+            payload = json.loads(payload_events[0][len(FILE_CHANGE_EVENT_PREFIX) :])
+            self.assertEqual(payload["tool"], "apply_patch")
+            self.assertEqual(payload["path"], "notes.txt")
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["added"], 2)
+            self.assertEqual(payload["removed"], 1)
 
     def test_explicit_unittest_module_counts_as_full_verification(self) -> None:
         call = ToolCall(
